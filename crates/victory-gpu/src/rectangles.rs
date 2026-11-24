@@ -45,10 +45,9 @@
 
 use std::sync::Arc;
 
-use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
-use windows::Win32::Graphics::Direct3D::ID3DBlob;
+use victory_shader::emit::rectangles::{rect_expand, rect_rewrite};
+use victory_shader::emit::{ROOT_CBV_SPACE, USER_DATA_SPACE};
 use windows::Win32::Graphics::Direct3D12::*;
-use windows::core::s;
 
 use crate::draw::VertexView;
 use crate::host::{HostList, host, transition};
@@ -216,261 +215,6 @@ pub(crate) fn dispatch_grid(records: u32) -> (u32, u32) {
     (x, y)
 }
 
-const REWRITE_SOURCE: &str = r#"
-#define RS "RootConstants(num32BitConstants=8, b0), UAV(u0), UAV(u1), UAV(u2), UAV(u3)"
-cbuffer Params : register(b0) {
-    uint records;
-    uint src_stride;
-    uint has_count;
-    uint max_src_verts;
-    uint vert_capacity;
-    uint need_verts;
-    uint pad0;
-    uint pad1;
-};
-RWByteAddressBuffer src_args : register(u0);
-RWByteAddressBuffer count_buf : register(u1);
-RWByteAddressBuffer alloc : register(u2);
-RWByteAddressBuffer dst_args : register(u3);
-
-[RootSignature(RS)]
-[numthreads(64, 1, 1)]
-void main(uint3 id : SV_DispatchThreadID) {
-    uint r = id.x;
-    if (r >= records) return;
-    uint dst_at = r * 16u;
-    if (has_count != 0u) {
-        uint live = count_buf.Load(0u);
-        if (r >= live) {
-            dst_args.Store4(dst_at, uint4(0u, 0u, 0u, 0u));
-            return;
-        }
-    }
-    uint4 rec = src_args.Load4(r * src_stride);
-    // The clamp's bounds again: 2^24 vertices, 2^26 vertex instances.
-    rec.x = min(rec.x, 1u << 24);
-    rec.y = min(rec.y, (1u << 26) / max(rec.x, 1u));
-    uint rects = rec.x / 3u;
-    uint src_verts = rects * 3u;
-    uint out_verts = rects * 6u;
-    uint out_start = 0u;
-    if (rects == 0u || rec.y == 0u || rec.z > max_src_verts || src_verts > max_src_verts - rec.z) {
-        out_verts = 0u;
-    } else if (need_verts != 0u) {
-        if (out_verts > vert_capacity) {
-            out_verts = 0u;
-        } else {
-            uint before;
-            alloc.InterlockedAdd(0u, out_verts, before);
-            if (before >= vert_capacity || out_verts > vert_capacity - before) {
-                out_verts = 0u;
-            } else {
-                out_start = before;
-            }
-        }
-    }
-    dst_args.Store4(dst_at, uint4(out_verts, rec.y, out_start, rec.w));
-}
-"#;
-
-const EXPAND_SOURCE: &str = r#"
-#define RS "RootConstants(num32BitConstants=8, b0), SRV(t0), UAV(u0), UAV(u1), UAV(u2), UAV(u3)"
-cbuffer Params : register(b0) {
-    uint records;
-    uint src_stride;
-    uint grid_x;
-    uint vb_src_bias;
-    uint vb_src_stride;
-    uint vb_dst_stride;
-    uint elem_count;
-    uint pad0;
-};
-ByteAddressBuffer elems : register(t0);
-RWByteAddressBuffer src_args : register(u0);
-RWByteAddressBuffer dst_args : register(u1);
-RWByteAddressBuffer src_vb : register(u2);
-RWByteAddressBuffer dst_vb : register(u3);
-
-uint load_u8(uint pos) {
-    uint w = src_vb.Load(pos & ~3u);
-    return (w >> ((pos & 3u) * 8u)) & 0xffu;
-}
-
-uint load_u16(uint pos) {
-    uint rem = pos & 3u;
-    uint w0 = src_vb.Load(pos & ~3u);
-    if (rem <= 2u) {
-        return (w0 >> (rem * 8u)) & 0xffffu;
-    }
-    uint w1 = src_vb.Load((pos & ~3u) + 4u);
-    return ((w0 >> 24u) | (w1 << 8u)) & 0xffffu;
-}
-
-uint load_u32(uint pos) {
-    uint rem = pos & 3u;
-    uint w0 = src_vb.Load(pos & ~3u);
-    if (rem == 0u) {
-        return w0;
-    }
-    uint w1 = src_vb.Load((pos & ~3u) + 4u);
-    return (w0 >> (rem * 8u)) | (w1 << ((4u - rem) * 8u));
-}
-
-void store_u8(uint pos, uint val) {
-    uint aligned = pos & ~3u;
-    uint shift = (pos & 3u) * 8u;
-    uint w = dst_vb.Load(aligned);
-    w = (w & ~(0xffu << shift)) | ((val & 0xffu) << shift);
-    dst_vb.Store(aligned, w);
-}
-
-void store_u16(uint pos, uint val) {
-    uint rem = pos & 3u;
-    if (rem <= 2u) {
-        uint aligned = pos & ~3u;
-        uint shift = rem * 8u;
-        uint w = dst_vb.Load(aligned);
-        w = (w & ~(0xffffu << shift)) | ((val & 0xffffu) << shift);
-        dst_vb.Store(aligned, w);
-    } else {
-        store_u8(pos, val & 0xffu);
-        store_u8(pos + 1u, (val >> 8u) & 0xffu);
-    }
-}
-
-void store_u32(uint pos, uint val) {
-    uint rem = pos & 3u;
-    if (rem == 0u) {
-        dst_vb.Store(pos, val);
-    } else {
-        uint aligned = pos & ~3u;
-        uint shift = rem * 8u;
-        uint inv = (4u - rem) * 8u;
-        uint mask = (1u << shift) - 1u;
-        uint w0 = dst_vb.Load(aligned);
-        w0 = (w0 & mask) | (val << shift);
-        dst_vb.Store(aligned, w0);
-        uint w1 = dst_vb.Load(aligned + 4u);
-        w1 = (w1 & ~mask) | (val >> inv);
-        dst_vb.Store(aligned + 4u, w1);
-    }
-}
-
-void copy_vertex(uint src_off, uint dst_off) {
-    uint full = vb_src_stride & ~3u;
-    for (uint b = 0u; b < full; b += 4u) {
-        dst_vb.Store(dst_off + b, load_u32(src_off + b));
-    }
-    uint rem = vb_src_stride & 3u;
-    if (rem != 0u) {
-        uint w = 0u;
-        for (uint k = 0u; k < rem; k++) {
-            w |= load_u8(src_off + full + k) << (k * 8u);
-        }
-        dst_vb.Store(dst_off + full, w);
-    }
-}
-
-float half_to_f32(uint h) {
-    uint sgn = (h >> 15u) << 31u;
-    uint ex = (h >> 10u) & 0x1fu;
-    uint man = h & 0x3ffu;
-    if (ex == 0u) {
-        if (man == 0u) return asfloat(sgn);
-        float v = (float)man * (1.0f / 16777216.0f);
-        return sgn != 0u ? -v : v;
-    }
-    if (ex == 31u) {
-        return asfloat(sgn | 0x7f800000u | (man << 13u));
-    }
-    return asfloat(sgn | ((ex + 112u) << 23u) | (man << 13u));
-}
-
-uint f32_to_half(float v) {
-    uint bits = asuint(v);
-    uint sgn = (bits >> 16u) & 0x8000u;
-    int ex = (int)((bits >> 23u) & 0xffu) - 127 + 15;
-    uint man = bits & 0x7fffffu;
-    if (ex >= 31) return sgn | 0x7c00u;
-    if (ex <= 0) {
-        // Half subnormals, rounded to even, as primitive.rs makes them.
-        if (ex < -10) return sgn;
-        uint sig = (1u << 23) | man;
-        uint shift = (uint)(14 - ex);
-        uint halfway = 1u << (shift - 1u);
-        uint q = sig >> shift;
-        uint r = sig & ((1u << shift) - 1u);
-        bool up = r > halfway || (r == halfway && (q & 1u) != 0u);
-        return sgn | (q + (up ? 1u : 0u));
-    }
-    // To nearest, halfway cases to even; added, not or-ed: a rounding carry
-    // out of the mantissa raises the exponent, as in primitive.rs.
-    uint retained = (man >> 13u) & 1u;
-    return sgn | (((uint)ex << 10u) + ((man + 0x0fffu + retained) >> 13u));
-}
-
-float read_comp(uint kind, uint pos) {
-    if (kind == 0u) return asfloat(load_u32(pos));
-    if (kind == 1u) return half_to_f32(load_u16(pos));
-    if (kind == 2u) return (float)load_u16(pos) / 65535.0f;
-    return (float)load_u8(pos) / 255.0f;
-}
-
-void write_comp(uint kind, uint pos, float v) {
-    if (kind == 0u) {
-        store_u32(pos, asuint(v));
-    } else if (kind == 1u) {
-        store_u16(pos, f32_to_half(v));
-    } else if (kind == 2u) {
-        store_u16(pos, (uint)(saturate(v) * 65535.0f + 0.5f));
-    } else {
-        store_u8(pos, (uint)(saturate(v) * 255.0f + 0.5f));
-    }
-}
-
-[RootSignature(RS)]
-[numthreads(64, 1, 1)]
-void main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID) {
-    uint r = gid.y * grid_x + gid.x;
-    if (r >= records) return;
-    uint out_verts = dst_args.Load(r * 16u);
-    uint rects = out_verts / 6u;
-    if (rects == 0u) return;
-    uint dst_start = dst_args.Load(r * 16u + 8u);
-    uint src_start = src_args.Load(r * src_stride + 8u);
-
-    for (uint rect = gtid.x; rect < rects; rect += 64u) {
-        uint v0_src = vb_src_bias + (src_start + rect * 3u) * vb_src_stride;
-        uint v1_src = v0_src + vb_src_stride;
-        uint v2_src = v1_src + vb_src_stride;
-        uint d = (dst_start + rect * 6u) * vb_dst_stride;
-
-        copy_vertex(v0_src, d);
-        copy_vertex(v1_src, d + vb_dst_stride);
-        copy_vertex(v2_src, d + vb_dst_stride * 2u);
-        copy_vertex(v0_src, d + vb_dst_stride * 3u);
-        copy_vertex(v2_src, d + vb_dst_stride * 4u);
-        uint v3_dst = d + vb_dst_stride * 5u;
-        copy_vertex(v0_src, v3_dst);
-
-        for (uint e = 0u; e < elem_count; e++) {
-            uint2 desc = elems.Load2(e * 8u);
-            uint offset = desc.x;
-            uint kind = desc.y & 0xffu;
-            uint comp_count = desc.y >> 8u;
-            uint comp_bytes = kind == 0u ? 4u : (kind == 3u ? 1u : 2u);
-            for (uint c = 0u; c < comp_count; c++) {
-                uint at = offset + c * comp_bytes;
-                float a = read_comp(kind, v0_src + at);
-                float b = read_comp(kind, v1_src + at);
-                float f = read_comp(kind, v2_src + at);
-                write_comp(kind, v3_dst + at, a + f - b);
-            }
-        }
-    }
-}
-"#;
-
 struct Pass {
     root: ID3D12RootSignature,
     pso: ID3D12PipelineState,
@@ -499,73 +243,59 @@ fn shaders() -> Option<&'static Shaders> {
         .as_ref()
 }
 
-fn compile_blob(
-    name: windows::core::PCSTR,
-    source: &str,
-) -> Result<ID3DBlob, (windows::core::Error, String)> {
-    let mut code: Option<ID3DBlob> = None;
-    let mut errors: Option<ID3DBlob> = None;
-    // SAFETY: the source and names live through the call; out pointers are ours.
-    let compiled = unsafe {
-        D3DCompile(
-            source.as_ptr().cast(),
-            source.len(),
-            name,
-            None,
-            None,
-            s!("main"),
-            s!("cs_5_1"),
-            0,
-            0,
-            &mut code,
-            Some(&mut errors),
-        )
-    };
-    if let Err(e) = compiled {
-        let mut msg = String::new();
-        if let Some(errors) = errors {
-            // SAFETY: the blob's own bytes.
-            let text = unsafe {
-                std::slice::from_raw_parts(
-                    errors.GetBufferPointer().cast::<u8>(),
-                    errors.GetBufferSize(),
-                )
-            };
-            msg = String::from_utf8_lossy(text).into_owned();
-            tracing::warn!("rectangle expander: {msg}");
-        }
-        return Err((e, msg));
-    }
-    code.ok_or_else(|| (windows::core::Error::empty(), String::new()))
-}
-
-fn compile_pass(
+/// A root signature of our own: the user data (eight dwords) as parameter
+/// 0, then root views, each at the register of its parameter in
+/// [`ROOT_CBV_SPACE`] as [`victory_shader::emit::rectangles`] reads them.
+fn pass(
     device: &ID3D12Device,
-    name: windows::core::PCSTR,
-    source: &str,
+    views: &[D3D12_ROOT_PARAMETER_TYPE],
+    code: &[u8],
 ) -> windows::core::Result<Pass> {
-    let code = compile_blob(name, source).map_err(|(e, _)| e)?;
-    // SAFETY: the blob's own bytes; the root signature is inside the shader.
-    unsafe {
-        let bytes =
-            std::slice::from_raw_parts(code.GetBufferPointer().cast::<u8>(), code.GetBufferSize());
-        let root: ID3D12RootSignature = device.CreateRootSignature(0, bytes)?;
-        let pso = device.CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
+    let mut params = vec![D3D12_ROOT_PARAMETER1 {
+        ParameterType: D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS,
+        Anonymous: D3D12_ROOT_PARAMETER1_0 {
+            Constants: D3D12_ROOT_CONSTANTS {
+                ShaderRegister: 0,
+                RegisterSpace: USER_DATA_SPACE,
+                Num32BitValues: 8,
+            },
+        },
+        ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
+    }];
+    for (n, &kind) in views.iter().enumerate() {
+        params.push(D3D12_ROOT_PARAMETER1 {
+            ParameterType: kind,
+            Anonymous: D3D12_ROOT_PARAMETER1_0 {
+                Descriptor: D3D12_ROOT_DESCRIPTOR1 {
+                    ShaderRegister: n as u32 + 1,
+                    RegisterSpace: ROOT_CBV_SPACE,
+                    Flags: D3D12_ROOT_DESCRIPTOR_FLAG_DATA_VOLATILE,
+                },
+            },
+            ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
+        });
+    }
+    let (root, _) = crate::pipeline::host::root_signature(device, &params, &[], true)?;
+    // SAFETY: the description points at the live root signature and code.
+    let pso = unsafe {
+        device.CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
             pRootSignature: std::mem::transmute_copy(&root),
             CS: D3D12_SHADER_BYTECODE {
-                pShaderBytecode: bytes.as_ptr().cast(),
-                BytecodeLength: bytes.len(),
+                pShaderBytecode: code.as_ptr().cast(),
+                BytecodeLength: code.len(),
             },
             ..Default::default()
-        })?;
-        Ok(Pass { root, pso })
-    }
+        })?
+    };
+    Ok(Pass { root, pso })
 }
 
 fn make() -> windows::core::Result<Shaders> {
     let device = &host().ok_or_else(windows::core::Error::empty)?.device;
-    let rewrite = compile_pass(device, s!("rect_rewrite"), REWRITE_SOURCE)?;
-    let expand = compile_pass(device, s!("rect_expand"), EXPAND_SOURCE)?;
+    const UAV: D3D12_ROOT_PARAMETER_TYPE = D3D12_ROOT_PARAMETER_TYPE_UAV;
+    const SRV: D3D12_ROOT_PARAMETER_TYPE = D3D12_ROOT_PARAMETER_TYPE_SRV;
+    let rewrite = pass(device, &[UAV; 4], &rect_rewrite())?;
+    let expand = pass(device, &[SRV, UAV, UAV, UAV, UAV], &rect_expand())?;
     Ok(Shaders { rewrite, expand })
 }
 
@@ -930,35 +660,14 @@ mod tests {
         assert!(u64::from(x) * u64::from(y) >= 65536);
     }
 
-    /// Both rectangle-expansion compute shaders compile with the system's
-    /// compiler and the host device accepts them.
+    /// The host device accepts both rectangle-expansion compute shaders and
+    /// their root signatures.
     #[test]
     fn rectangle_expander_builds() {
         if host().is_none() {
             return; // no host GPU here
         }
         assert!(shaders().is_some());
-    }
-
-    /// Both HLSL shaders compile with `D3DCompile` when the host compiler
-    /// supports `cs_5_1` raw buffers (`RWByteAddressBuffer::Load`).
-    #[test]
-    fn hlsl_compiles() {
-        let probe = r#"
-            RWByteAddressBuffer b : register(u0);
-            [RootSignature("UAV(u0)")]
-            [numthreads(1, 1, 1)]
-            void main() { b.Store(0, b.Load(0)); }
-        "#;
-        if compile_blob(s!("probe"), probe).is_err() {
-            return; // compiler here (e.g. Wine's vkd3d-shader) lacks RWByteAddressBuffer::Load
-        }
-        if let Err((e, msg)) = compile_blob(s!("rect_rewrite"), REWRITE_SOURCE) {
-            panic!("rect_rewrite HLSL failed ({e}): {msg}");
-        }
-        if let Err((e, msg)) = compile_blob(s!("rect_expand"), EXPAND_SOURCE) {
-            panic!("rect_expand HLSL failed ({e}): {msg}");
-        }
     }
 
     /// End-to-end GPU test: runs `rect_rewrite` and `rect_expand` on synthetic
