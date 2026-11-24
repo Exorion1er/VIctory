@@ -114,6 +114,8 @@ fn build() -> &'static [u8; 32] {
                 }
             };
         }
+        // And which clean-up passes ran over the translated code.
+        key.update(&victory_shader::emit::shader_opt().to_le_bytes());
         *key.finalize().as_bytes()
     })
 }
