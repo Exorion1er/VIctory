@@ -33,6 +33,9 @@ pub(crate) struct Pending {
     /// whether a draw or dispatch has requested it yet.
     pub(super) key: String,
     used: AtomicBool,
+    /// When a thread began to make it (`crate::host::now_ms`, 0: not yet),
+    /// for the drop reasons (diagnostics).
+    started: AtomicU64,
 }
 
 // SAFETY: D3D12 objects are free-threaded; the graphics state (whose input
@@ -51,10 +54,14 @@ impl Pending {
             made: OnceLock::new(),
             key,
             used: AtomicBool::new(false),
+            started: AtomicU64::new(0),
         }
     }
 
     fn make(&self) {
+        if self.made.get().is_none() {
+            let _ = self.started.compare_exchange(0, crate::host::now_ms().max(1), Ordering::Relaxed, Ordering::Relaxed);
+        }
         self.made
             .get_or_init(|| HostPipeline::new(&self.shaders, self.graphics.as_deref()));
         let (lock, done) = &DONE;
@@ -80,7 +87,17 @@ pub(crate) fn key(shaders: &[Arc<Shader>], graphics: Option<&GraphicsState>) -> 
 pub(crate) fn missing(p: &Pending) -> Option<String> {
     match p.made.get() {
         Some(Some(_)) => None,
-        None => Some("being made".into()),
+        // Lot 7: one a thread has been making for half a minute or more,
+        // by its shaders: run.sh notes six "being made" for whole runs
+        // (their draws dropped in every frame), with nothing to name them.
+        None => {
+            let since = p.started.load(Ordering::Relaxed);
+            if since != 0 && crate::host::now_ms().saturating_sub(since) >= 30_000 {
+                Some(format!("being made for 30 s or more {:?}", p.shaders))
+            } else {
+                Some("being made".into())
+            }
+        }
         Some(None) => {
             let failed: Vec<String> = p
                 .shaders
