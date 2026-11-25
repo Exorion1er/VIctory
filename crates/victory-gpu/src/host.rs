@@ -589,6 +589,8 @@ fn create() -> windows::core::Result<Host> {
             victory_shader::emit::set_host_max_wave(lanes);
             victory_shader::emit::set_host_pixel_wave(o1.WaveLaneCountMax);
         }
+        // logs the switch once, at the start
+        crate::descriptor::host::placed_uav_mirror();
         let messages = debug
             .then(|| device.cast::<ID3D12InfoQueue>().ok())
             .flatten();
