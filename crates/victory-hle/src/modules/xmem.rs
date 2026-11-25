@@ -153,6 +153,16 @@ pub extern "system" fn XMemVirtualAlloc(
             constrained.into(),
         )
     };
+    if constrained && !at.is_null() {
+        // Where the GPU side's copies may ask the write watch, and where
+        // they need not (`victory_gpu`, lot 8).
+        victory_gpu::title_memory_reserved(
+            at as usize,
+            size,
+            kind & MEM_WRITE_WATCH != 0,
+            kind & MEM_RESERVE_PLACEHOLDER != 0,
+        );
+    }
     if base.is_null() {
         tracing::debug!(
             size,

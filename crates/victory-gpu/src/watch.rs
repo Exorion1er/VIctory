@@ -74,9 +74,10 @@ const AHEAD_MAX: usize = (1 << 30) / PAGE;
 /// 456 ms, in run 14). Ranges that are not write-watched, or lie alone, are
 /// left to `writes`.
 pub(crate) fn ask_ahead(ranges: &[(usize, usize)]) {
+    let known = crate::l8ww::known_views();
     let mut pieces: Vec<(usize, usize)> = ranges
         .iter()
-        .filter(|r| r.0 < r.1)
+        .filter(|r| r.0 < r.1 && !(known && placeholder_at(r.0)))
         .map(|&(start, end)| (start / PAGE, end.div_ceil(PAGE)))
         .collect();
     if pieces.len() < 2 {
@@ -188,8 +189,9 @@ pub(crate) fn ask_once(ranges: &[(usize, usize)]) {
     // such range asked again at each of its 70 flushes (run 76: 2,300
     // askings a frame with the switch on, as without it). They are asked
     // here, once; what is not write-watched stays with `writes`.
+    let known = crate::l8ww::known_views();
     for &(start, end) in ranges {
-        if start >= end {
+        if start >= end || (known && placeholder_at(start)) {
             continue;
         }
         let (first, last) = (start / PAGE, end.div_ceil(PAGE));
@@ -330,22 +332,29 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
     let mut granularity = 0;
     #[cfg(feature = "diagnostics")]
     let started = std::time::Instant::now();
-    let asking = std::time::Instant::now();
-    // SAFETY: the answer buffer holds `count` entries.
-    let failed = unsafe {
-        GetWriteWatch(
-            WRITE_WATCH_FLAG_RESET,
-            (first * PAGE) as *const _,
-            (last - first) * PAGE,
-            j.found.as_mut_ptr().cast(),
-            &mut count,
-            &mut granularity,
-        )
-    } != 0;
-    crate::l8ww::add_call(
-        if failed { crate::l8ww::Site::WatchFailed } else { crate::l8ww::Site::WatchOk },
-        asking.elapsed().as_micros() as u64,
-    );
+    // View memory is not write-watched: the guards answer, no call.
+    let failed = if crate::l8ww::known_views() && placeholder_at(start) {
+        crate::l8ww::add(crate::l8ww::Count::WatchesSkipped, 1);
+        true
+    } else {
+        let asking = std::time::Instant::now();
+        // SAFETY: the answer buffer holds `count` entries.
+        let failed = unsafe {
+            GetWriteWatch(
+                WRITE_WATCH_FLAG_RESET,
+                (first * PAGE) as *const _,
+                (last - first) * PAGE,
+                j.found.as_mut_ptr().cast(),
+                &mut count,
+                &mut granularity,
+            )
+        } != 0;
+        crate::l8ww::add_call(
+            if failed { crate::l8ww::Site::WatchFailed } else { crate::l8ww::Site::WatchOk },
+            asking.elapsed().as_micros() as u64,
+        );
+        failed
+    };
     let guarded = if failed {
         count = 0;
         if !guarded {
@@ -380,6 +389,50 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
             .map(|(&p, &w)| (p, w))
             .collect(),
     ))
+}
+
+/// The title's reservations the runtime made (`victory-hle` xmem), by
+/// start: their end and whether they are placeholders (for physical-page
+/// views, never write-watched; else write-watched).
+static RESERVED: Mutex<BTreeMap<usize, (usize, bool)>> = Mutex::new(BTreeMap::new());
+
+/// The runtime reserved title memory `[at, at + len)`: write-watched
+/// (`watched`), a placeholder for physical-page views (`placeholder`), or
+/// neither. What the guards held there belongs to memory that is gone.
+pub fn title_memory_reserved(at: usize, len: usize, watched: bool, placeholder: bool) {
+    let end = at.saturating_add(len);
+    {
+        let mut r = RESERVED.lock().unwrap_or_else(|e| e.into_inner());
+        let over: Vec<usize> = r
+            .range(..end)
+            .filter(|&(&start, &(stop, _))| start < end && stop > at)
+            .map(|(&start, _)| start)
+            .collect();
+        for start in over {
+            r.remove(&start);
+        }
+        if watched || placeholder {
+            r.insert(at, (end, placeholder));
+        }
+    }
+    let mut g = guards_waited();
+    let g = &mut *g;
+    let range = at / BLOCK..end.div_ceil(BLOCK);
+    for set in [&mut g.protected, &mut g.clean, &mut g.absent] {
+        let blocks: Vec<usize> = set.range(range.clone()).copied().collect();
+        for block in blocks {
+            set.remove(&block);
+        }
+    }
+}
+
+/// Whether `at` lies in a placeholder reservation of the runtime's
+/// ([`title_memory_reserved`]): view memory, never write-watched.
+fn placeholder_at(at: usize) -> bool {
+    let r = RESERVED.lock().unwrap_or_else(|e| e.into_inner());
+    r.range(..=at)
+        .next_back()
+        .is_some_and(|(_, &(end, placeholder))| placeholder && at < end)
 }
 
 /// Guarded blocks of view memory.
@@ -1086,6 +1139,108 @@ mod tests {
             windows_sys::Win32::Foundation::CloseHandle(section);
         }
         title_memory_remapped(p, 3 * BLOCK);
+    }
+
+    /// A placeholder of `blocks` blocks and a pagefile section as big,
+    /// told to the guards as the runtime's ([`title_memory_reserved`]);
+    /// `map(block)` maps the section's block there.
+    fn placeholder(blocks: usize) -> (usize, usize) {
+        use windows_sys::Win32::System::Memory::{
+            CreateFileMappingW, MEM_RESERVE_PLACEHOLDER, PAGE_NOACCESS, VirtualAlloc2,
+        };
+        use windows_sys::Win32::System::Threading::GetCurrentProcess;
+        // SAFETY: a fresh placeholder and a fresh pagefile section.
+        let (p, section) = unsafe {
+            let p = VirtualAlloc2(
+                GetCurrentProcess(),
+                std::ptr::null(),
+                blocks * BLOCK,
+                MEM_RESERVE | MEM_RESERVE_PLACEHOLDER,
+                PAGE_NOACCESS,
+                std::ptr::null_mut(),
+                0,
+            ) as usize;
+            assert_ne!(p, 0);
+            let section = CreateFileMappingW(
+                -1isize as _,
+                std::ptr::null(),
+                PAGE_READWRITE,
+                0,
+                (blocks * BLOCK) as u32,
+                std::ptr::null(),
+            );
+            assert!(!section.is_null());
+            (p, section as usize)
+        };
+        title_memory_reserved(p, blocks * BLOCK, false, true);
+        (p, section)
+    }
+
+    fn map_block(p: usize, section: usize, block: usize) {
+        use windows_sys::Win32::System::Memory::{
+            MEM_PRESERVE_PLACEHOLDER, MEM_REPLACE_PLACEHOLDER, MapViewOfFile3,
+        };
+        use windows_sys::Win32::System::Threading::GetCurrentProcess;
+        // SAFETY: splits the placeholder at the block and maps the
+        // section's block there.
+        let view = unsafe {
+            VirtualFree((p + block * BLOCK) as *mut _, BLOCK, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER);
+            MapViewOfFile3(
+                section as _,
+                GetCurrentProcess(),
+                (p + block * BLOCK) as *const _,
+                (block * BLOCK) as u64,
+                BLOCK,
+                MEM_REPLACE_PLACEHOLDER,
+                PAGE_READWRITE,
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        assert_eq!(view.Value as usize, p + block * BLOCK);
+        title_memory_remapped(p + block * BLOCK, BLOCK);
+    }
+
+    fn drop_placeholder(p: usize, section: usize, blocks: usize, mapped: &[usize]) {
+        use windows_sys::Win32::System::Memory::{
+            MEMORY_MAPPED_VIEW_ADDRESS, MEM_PRESERVE_PLACEHOLDER, UnmapViewOfFile2,
+        };
+        use windows_sys::Win32::System::Threading::GetCurrentProcess;
+        title_memory_remapped(p, blocks * BLOCK);
+        // SAFETY: our views, placeholder and section.
+        unsafe {
+            for &block in mapped {
+                let view = MEMORY_MAPPED_VIEW_ADDRESS { Value: (p + block * BLOCK) as *mut _ };
+                UnmapViewOfFile2(GetCurrentProcess(), view, MEM_PRESERVE_PLACEHOLDER);
+            }
+            windows_sys::Win32::Foundation::CloseHandle(section as _);
+        }
+        // The placeholder stays reserved: the journal remembers its pages,
+        // and a later test's allocation there would find them written.
+        let _ = blocks;
+    }
+
+    /// View memory in a placeholder of the runtime's is answered by the
+    /// guards, without the write watch's refusal first
+    /// (`VICTORY_L8_WW_KNOWN_VIEWS`): what is written is reported, what is
+    /// not is not, and a caller that takes no guards hears "not watched".
+    #[test]
+    fn view_memory_in_a_known_placeholder_is_answered_by_the_guards() {
+        let (p, section) = placeholder(3);
+        map_block(p, section, 0);
+        map_block(p, section, 1);
+        let (start, end) = (p, p + 3 * BLOCK);
+        assert!(writes(start, end, false).is_none());
+        let (now, first) = writes(start, end, true).expect("guarded");
+        assert!((0..3).all(|b| first.contains(&((p + b * BLOCK) / PAGE, now))));
+        let (now, again) = writes(start, end, true).expect("guarded");
+        assert!(again.iter().all(|&(_, w)| w < now), "nothing written since");
+        // SAFETY: inside the mapped second block.
+        unsafe { ((p + BLOCK + 8) as *mut u8).write_volatile(1) };
+        let (now, after) = writes(start, end, true).expect("guarded");
+        let fresh: Vec<usize> = after.iter().filter(|&&(_, w)| w == now).map(|&(page, _)| page).collect();
+        assert_eq!(fresh, [(p + BLOCK) / PAGE]);
+        drop_placeholder(p, section, 3, &[0, 1]);
     }
 
     /// Blocks of a placeholder between views are reported once, then not

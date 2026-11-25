@@ -12,7 +12,7 @@
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 
 /// The switches: name, on by default.
-const SWITCHES: &[(&str, bool)] = &[];
+const SWITCHES: &[(&str, bool)] = &[("WW_KNOWN_VIEWS", true)];
 
 /// Whether switch `name` (`VICTORY_L8_<name>`) is on.
 fn read(name: &str, default: bool) -> bool {
@@ -29,7 +29,6 @@ fn switches() -> &'static [bool] {
 }
 
 /// Whether the switch called `name` is on.
-#[allow(dead_code)]
 fn on(name: &str) -> bool {
     SWITCHES
         .iter()
@@ -52,6 +51,17 @@ pub(crate) fn announce() {
                 .join(" ")
         );
     });
+}
+
+/// `VICTORY_L8_WW_KNOWN_VIEWS` (on): no `GetWriteWatch` for a range that
+/// begins in a placeholder reservation of the runtime's (`xmem`, where
+/// physical pages are mapped as views): such memory is never write-watched,
+/// the call fails and the guards answer. It failed for every check of view
+/// memory (and twice for a texture there), and a submission's one asking
+/// split a run of view ranges in halves until each failed alone, a call
+/// each: calls that took the address space's lock for nothing.
+pub(crate) fn known_views() -> bool {
+    on("WW_KNOWN_VIEWS")
 }
 
 /// The calls counted, each with its microseconds.
@@ -94,9 +104,12 @@ pub(crate) enum Count {
     JournalWaitUs,
     /// Guard faults on a block that faulted earlier in the same frame.
     FaultsAgain,
+    /// `GetWriteWatch` calls not made: the range is view memory
+    /// ([`known_views`]).
+    WatchesSkipped,
 }
 
-const COUNTS: usize = 3;
+const COUNTS: usize = 4;
 
 static COUNT: [AtomicU64; COUNTS] = [const { AtomicU64::new(0) }; COUNTS];
 
@@ -148,12 +161,14 @@ pub(crate) fn log(frames: f64) {
     let (read, read_ms) = s(Site::Read);
     let (fault, fault_ms) = s(Site::Fault);
     tracing::info!(
-        "lot 8 per frame: GetWriteWatch {ok:.0} answered {ok_ms:.2} ms, {failed:.0} failed {failed_ms:.2} ms; \
+        "lot 8 per frame: GetWriteWatch {ok:.0} answered {ok_ms:.2} ms, {failed:.0} failed {failed_ms:.2} ms, {:.0} not made \
+         (view memory, WW_KNOWN_VIEWS); \
          guard checks {guard:.0} {guard_ms:.2} ms; VirtualProtect {protect:.0} read-only {protect_ms:.2} ms, \
          {open:.0} read-write {open_ms:.2} ms; VirtualQuery {query:.0} {query_ms:.2} ms; QueryWorkingSetEx \
          {set:.0} {set_ms:.2} ms; ReadProcessMemory {read:.0} {read_ms:.2} ms; guard faults {fault:.0} \
          ({:.0} on a block that faulted earlier in the frame) {fault_ms:.2} ms in the handler; waits for our \
          locks: guards {:.2} ms, write-watch journal {:.2} ms",
+        c[Count::WatchesSkipped as usize],
         c[Count::FaultsAgain as usize],
         c[Count::GuardsWaitUs as usize] / 1e3,
         c[Count::JournalWaitUs as usize] / 1e3,
