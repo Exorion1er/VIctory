@@ -1442,6 +1442,33 @@ impl HostHeap {
         Some(view)
     }
 
+    /// Lot 7 (`VICTORY_L7_SYNC_MERGE`): the heap sync's [`HostHeap::mirror`].
+    /// With `VICTORY_L6_SUBMIT_SLOTS` and a list, a buffer view is made at
+    /// once and its bytes brought up to date with `list`, as the
+    /// submission's fresh slots ([`HostHeap::submit_fresh`]) would do right
+    /// after the sync made it null; anything else as before.
+    pub(crate) fn mirror_synced(&self, index: u32, handle: u64, list: Option<&crate::host::HostList>) {
+        if let Some(list) = list
+            && !self.sampler
+            && index < self.count
+            && crate::l7perf::sync_merge()
+            && crate::l6::submit_slots()
+        {
+            // SAFETY: the handle is a descriptor slot in title memory.
+            let [tag, i, generation] = unsafe { (handle as *const [u32; 3]).read_unaligned() };
+            if tag == VIEW_TAG && view_at(i, generation).is_some_and(|v| v.is_buffer()) {
+                if let Some(view) = self.mirror(index, handle, true) {
+                    self.fresh.lock().unwrap_or_else(|e| e.into_inner()).remove(&index);
+                    if let Some((shadow, address, len)) = buffer_copy(&view) {
+                        shadow.refresh(list, address, len);
+                    }
+                }
+                return;
+            }
+        }
+        let _ = self.mirror(index, handle, false);
+    }
+
     /// Whether slot `index` was made from a record (tests).
     #[cfg(test)]
     pub(crate) fn made(&self, index: u32) -> bool {

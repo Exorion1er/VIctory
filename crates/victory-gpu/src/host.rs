@@ -4367,7 +4367,7 @@ impl Host {
         // Descriptors the title copied into its heaps itself (lot 6,
         // `VICTORY_L6_HEAP_SYNC`), before anything of this submission is
         // prepared.
-        crate::descriptor::sync_heaps();
+        crate::descriptor::sync_heaps_for(runs.first().copied());
         // Buffer views written since the last submission, made for shaders
         // that pick them from the heap (lot 6, `VICTORY_L6_SUBMIT_SLOTS`):
         // their refreshes go with the first list, ahead of the checks below.

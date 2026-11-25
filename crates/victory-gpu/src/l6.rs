@@ -19,7 +19,7 @@ fn switches() -> &'static [(&'static str, bool); 5] {
 
 /// `VICTORY_L6_HEAP_SYNC`: records the title copies into its shader-visible
 /// heaps as bytes (no call) are mirrored at each submission
-/// (`crate::descriptor::sync_heaps`).
+/// (`crate::descriptor::sync_heaps_for`).
 pub(crate) fn heap_sync() -> bool {
     switches()[0].1
 }

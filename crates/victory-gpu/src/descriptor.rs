@@ -60,7 +60,7 @@ pub(crate) struct Heap {
     #[cfg(windows)]
     pending: std::sync::Mutex<Vec<u32>>,
     /// The title also copies descriptors (our records) into a shader-visible
-    /// heap itself, as bytes (`sync_heaps`): the last write-watch asking
+    /// heap itself, as bytes (`sync_heaps_for`): the last write-watch asking
     /// looked at, the frame of the last whole look (memory that is not
     /// watched), and each slot's record as last mirrored (`u64::MAX`: not
     /// looked at yet).
@@ -150,7 +150,7 @@ fn mirror(handle: u64) {
     let Some((heap, index)) = shader_slot(handle) else {
         return;
     };
-    // Made by a call: not a copy `sync_heaps` has to find.
+    // Made by a call: not a copy `sync_heaps_for` has to find.
     {
         let mut synced = heap.synced.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(key) = synced.2.get_mut(index as usize) {
@@ -199,8 +199,12 @@ fn record_key_of(tag: u32, i: u32, generation: u32) -> u64 {
 /// as a call would have: at each submission, before its lists run. Memory
 /// that is not write-watched (a heap of ours) is looked at whole, once a
 /// frame.
+///
+/// `list`: the submission's first list. With
+/// `VICTORY_L7_SYNC_MERGE` a buffer view found is made at once and its
+/// bytes brought up to date with `list` ([`host::HostHeap::mirror_synced`]).
 #[cfg(windows)]
-pub(crate) fn sync_heaps() {
+pub(crate) fn sync_heaps_for(list: Option<&crate::host::HostList>) {
     if !crate::l6::heap_sync() {
         return;
     }
@@ -276,7 +280,7 @@ pub(crate) fn sync_heaps() {
                 }
                 *seen = key;
                 slots += 1;
-                host.mirror(index as u32, handle, false);
+                host.mirror_synced(index as u32, handle, list);
             }
         }
     }
@@ -1220,7 +1224,7 @@ mod tests {
         assert_eq!(create(desc, placement, &mut h), S_OK);
         if let Some(host) = heap(h).host() {
             // A first sync looks at what is there.
-            sync_heaps();
+            sync_heaps_for(None);
             // Our record, written where no heap sees it, then copied in.
             let mut elsewhere = [0u64; 2];
             let at = elsewhere.as_mut_ptr() as u64;
@@ -1229,7 +1233,7 @@ mod tests {
             // SAFETY: 16 bytes of each, ours.
             unsafe { std::ptr::copy_nonoverlapping(at as *const u8, slot as *mut u8, 16) };
             assert!(!host.made(5));
-            sync_heaps();
+            sync_heaps_for(None);
             assert_eq!(host.made(5), crate::l6::heap_sync(), "made at the sync");
         }
         slot::<extern "system" fn(This) -> u32>(h, 0x10)(h);

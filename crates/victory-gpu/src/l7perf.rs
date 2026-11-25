@@ -8,11 +8,11 @@ fn on(name: &str) -> bool {
     std::env::var_os(format!("VICTORY_L7_{name}")).is_none_or(|v| v != "0")
 }
 
-const NAMES: [&str; 1] = ["PIPELINE_WAIT_ONCE"];
+const NAMES: [&str; 2] = ["PIPELINE_WAIT_ONCE", "SYNC_MERGE"];
 
 /// The switches, read once: (name, on).
-fn switches() -> &'static [(&'static str, bool); 1] {
-    static S: std::sync::OnceLock<[(&str, bool); 1]> = std::sync::OnceLock::new();
+fn switches() -> &'static [(&'static str, bool); 2] {
+    static S: std::sync::OnceLock<[(&str, bool); 2]> = std::sync::OnceLock::new();
     S.get_or_init(|| NAMES.map(|n| (n, on(n))))
 }
 
@@ -25,6 +25,16 @@ fn switches() -> &'static [(&'static str, bool); 1] {
 /// 50.1 ms of every frame of run 11.
 pub(crate) fn pipeline_wait_once() -> bool {
     switches()[0].1
+}
+
+/// `VICTORY_L7_SYNC_MERGE`: with `VICTORY_L6_HEAP_SYNC` and
+/// `VICTORY_L6_SUBMIT_SLOTS`, a buffer view the heap sync finds is made at
+/// once with its bytes brought up to date by the submission, instead of
+/// being made null by the sync and made again by the submission's fresh
+/// slots right after (two host descriptor writes, and a null in between
+/// that a flight in the air could read).
+pub(crate) fn sync_merge() -> bool {
+    switches()[1].1
 }
 
 /// Logs the switches, once.
