@@ -614,7 +614,7 @@ impl HostHeap {
                     })
             }
         };
-        let extra = if sampler { 0 } else { DYNAMIC };
+        let mut extra = if sampler { 0 } else { DYNAMIC };
         // With `VICTORY_L6_HEAP_CLAMP`, a view heap ends at the null slot
         // shaders clamp view indices to: the title's slots, the dynamic
         // ones, then null up to and with that slot.
@@ -622,6 +622,19 @@ impl HostHeap {
             probe_view_limit();
         }
         let uncapped = !sampler && victory_shader::emit::view_heap_limit() == UNCAPPED_VIEWS - 1;
+        // Lot 7 (`VICTORY_L7_DYNAMIC_SLOTS`): the heap is made with
+        // `UNCAPPED_VIEWS` slots whatever the title's, so the slots between
+        // the title's and the null slot at the end are dynamic ones too:
+        // 851,967 for the retail game's 1,245,184, not 262,144. A frame
+        // asks for 26,000-29,000 tables, some of 135 slots; with 2^18 the
+        // tables of 85 of run 11's 426 meter lines were refused (up to
+        // 3,264 a frame), and each draw or indirect batch that read one was
+        // dropped ("prepare failed"): geometry gone for that frame. The
+        // heap's memory does not change.
+        if uncapped && crate::l7::dynamic_slots() && count + DYNAMIC < UNCAPPED_VIEWS {
+            extra = UNCAPPED_VIEWS - 1 - count;
+            tracing::info!(count, dynamic = extra, "VICTORY_L7_DYNAMIC_SLOTS: the view heap's slots past the title's up to its null slot are dynamic");
+        }
         if uncapped && count + extra >= UNCAPPED_VIEWS {
             tracing::warn!(count, "a title view heap past {UNCAPPED_VIEWS}: indices past the clamp read a title slot");
         }
@@ -684,8 +697,8 @@ impl HostHeap {
             sampler,
             made: Mutex::new(vec![0; count as usize]),
             kept: Mutex::new(vec![None; (count + extra) as usize]),
-            next: Mutex::new((0, vec![false; DYNAMIC as usize])),
-            free: std::sync::atomic::AtomicU32::new(DYNAMIC),
+            next: Mutex::new((0, vec![false; extra as usize])),
+            free: std::sync::atomic::AtomicU32::new(extra),
             too_long: std::sync::atomic::AtomicU32::new(u32::MAX),
             strides,
             buffers: Mutex::default(),
@@ -791,7 +804,7 @@ impl HostHeap {
         let mut run = 0;
         let mut found = None;
         let mut last = usize::MAX;
-        for at in starts.take(if enough { DYNAMIC as usize } else { 0 }) {
+        for at in starts.take(if enough { self.dynamic as usize } else { 0 }) {
             // A run cannot wrap past the end.
             if at != last.wrapping_add(1) {
                 run = 0;
@@ -821,7 +834,7 @@ impl HostHeap {
         crate::copystat::add(crate::copystat::C::DynamicNs, started.elapsed().as_nanos() as u64);
         taken[first..first + n].fill(true);
         self.free.fetch_sub(n as u32, std::sync::atomic::Ordering::Relaxed);
-        *next = ((first + n) % DYNAMIC as usize) as u32;
+        *next = ((first + n) % self.dynamic as usize) as u32;
         Some(self.count + first as u32)
     }
 

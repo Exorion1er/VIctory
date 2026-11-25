@@ -32,6 +32,8 @@ mod host;
 #[cfg(windows)]
 mod l6;
 #[cfg(windows)]
+mod l7;
+#[cfg(windows)]
 mod indirect;
 #[cfg(windows)]
 mod inplace;

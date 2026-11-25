@@ -4362,6 +4362,7 @@ impl Host {
         // and the ranges shaders write are per host copy, not per submission.
         let mut submitted = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
         crate::l6::announce();
+        crate::l7::announce();
         // Descriptors the title copied into its heaps itself (lot 6,
         // `VICTORY_L6_HEAP_SYNC`), before anything of this submission is
         // prepared.
@@ -6268,6 +6269,8 @@ impl Meter {
         }
         // Lot 6: host slots that read nothing, and what its switches did.
         crate::l6::log(frames);
+        // Lot 7: what its switches did.
+        crate::l7::log(frames);
         // Passes over the heap's buffer views for shaders that pick them by index.
         let picked = crate::draw::HEAP_BUFFER_PASSES.swap(0, Ordering::Relaxed) as f64 / frames;
         let picked_ms =
