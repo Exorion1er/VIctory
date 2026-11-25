@@ -183,6 +183,11 @@ fn main() -> Result<()> {
             if let Some(n) = std::env::var("VICTORY_HOST_WAVE").ok().and_then(|v| v.parse().ok()) {
                 victory_shader::emit::set_host_max_wave(n);
             }
+            // `VICTORY_HOST_PIXEL_WAVE=64`: pixel and vertex programs as for a host that may run
+            // them in waves of 64 (AMD; the runtime sets it from the card)
+            if let Some(n) = std::env::var("VICTORY_HOST_PIXEL_WAVE").ok().and_then(|v| v.parse().ok()) {
+                victory_shader::emit::set_host_pixel_wave(n);
+            }
             translate::run(paths, validate, pipelines, list, jobs)
         }
         Command::Run {

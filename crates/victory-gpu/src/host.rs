@@ -586,6 +586,13 @@ fn create() -> windows::core::Result<Host> {
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(o1.WaveLaneCountMax);
             tracing::info!(min = o1.WaveLaneCountMin, max = o1.WaveLaneCountMax, compute = lanes, "host wave lanes");
+            // lot6 A/B switches (on: lot5's behaviour; `=0`: run 8's)
+            tracing::info!(
+                plane_pass = l6_plane_pass(),
+                ps_halves = std::env::var_os("VICTORY_PS_HALVES").is_none_or(|v| v != "0"),
+                card_buffers = crate::shadow::cards(),
+                "A/B switches (VICTORY_L6_PLANE_PASS, VICTORY_PS_HALVES, VICTORY_CARD_BUFFERS)"
+            );
             victory_shader::emit::set_host_max_wave(lanes);
             victory_shader::emit::set_host_pixel_wave(o1.WaveLaneCountMax);
         }
@@ -858,6 +865,14 @@ float plane(float4 p : SV_Position) : SV_Depth {
 }
 "#;
 
+/// Whether depth planes are drawn from their twins (`HostList::pass_plane`). Since PR #127
+/// (lot5) the pass compiles under Wine; before it the pipeline was refused and the planes
+/// stayed as they were (run 8). `VICTORY_L6_PLANE_PASS=0` puts that back, for an A/B run.
+fn l6_plane_pass() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_L6_PLANE_PASS").is_none_or(|v| v != "0"))
+}
+
 /// Views of twins the pass reads, in a heap of ours used as a ring.
 /// shortcut: a view must last until its list has run; with one or two
 /// passes a frame the ring is far from coming round.
@@ -1073,6 +1088,10 @@ fn record_plane_pass(
         19 => 20,
         typed => typed,
     });
+    // (as in run 8, where the pipeline was refused: the moves around the pass stay)
+    if !l6_plane_pass() {
+        return;
+    }
     let Some((root, pipeline)) = pass.pipeline(steps, format) else {
         return;
     };

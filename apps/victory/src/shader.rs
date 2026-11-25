@@ -120,6 +120,18 @@ pub fn run(paths: Vec<PathBuf>, verbose: bool, disasm: bool, effects: bool) -> R
                 let Ok(container) = Container::parse(&bytes) else {
                     continue;
                 };
+                // `VICTORY_SHADER_ONLY=<hash prefix>,...`: those containers alone (the hashes
+                // a run's log names), each also written to `VICTORY_SHADER_OUT/<hash>.bin`.
+                if let Ok(only) = std::env::var("VICTORY_SHADER_ONLY") {
+                    let hash = blake3::hash(&bytes).to_hex()[..16].to_owned();
+                    if !only.split(',').any(|o| !o.is_empty() && hash.starts_with(o.trim())) {
+                        continue;
+                    }
+                    println!("== hash {hash}");
+                    if let Ok(out) = std::env::var("VICTORY_SHADER_OUT") {
+                        let _ = std::fs::write(PathBuf::from(out).join(format!("{hash}.bin")), &bytes);
+                    }
+                }
                 found_here += 1;
                 t.containers += 1;
                 let dxil = container.part(FourCC::DXIL);
