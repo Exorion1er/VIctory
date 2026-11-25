@@ -12,9 +12,9 @@ fn on(name: &str) -> bool {
 }
 
 /// The switches, read once: (name, on).
-fn switches() -> &'static [(&'static str, bool); 3] {
-    static S: std::sync::OnceLock<[(&str, bool); 3]> = std::sync::OnceLock::new();
-    S.get_or_init(|| ["HEAP_SYNC", "SUBMIT_SLOTS", "VIEW_COPY"].map(|n| (n, on(n))))
+fn switches() -> &'static [(&'static str, bool); 5] {
+    static S: std::sync::OnceLock<[(&str, bool); 5]> = std::sync::OnceLock::new();
+    S.get_or_init(|| ["HEAP_SYNC", "SUBMIT_SLOTS", "VIEW_COPY", "LATE_ALIAS", "LATE_UNCOPIED"].map(|n| (n, on(n))))
 }
 
 /// `VICTORY_L6_HEAP_SYNC`: records the title copies into its shader-visible
@@ -38,6 +38,26 @@ pub(crate) fn submit_slots() -> bool {
 /// bytes instead of being left null (`crate::shadow::exact`).
 pub(crate) fn view_copy() -> bool {
     switches()[2].1
+}
+
+/// `VICTORY_L6_LATE_ALIAS` (fork PR #191, fork issue #89): with flights in
+/// the air (`VICTORY_LATE_WAIT`, `VICTORY_RELAY`), a submission that
+/// refreshes a host copy over title memory that a flight's shaders write
+/// through another copy (a window over a buffer, a view's own copy), that
+/// a flight's texture read-back or bottom-of-pipe write lands in, waits for
+/// that flight first. Without it the refresh took the title's bytes from
+/// before the flight's writes were copied back: skinned vertices from an
+/// earlier frame or zeros, on whichever submissions the card was behind.
+pub(crate) fn late_alias() -> bool {
+    switches()[3].1
+}
+
+/// `VICTORY_L6_LATE_UNCOPIED` (fork PR #206): with flights in the air, a
+/// refresh of a range a flight's shaders may write also takes the pages
+/// the copy never took (a copy made since: a new window, a view's own
+/// copy), not only those the write-watch journal names; they stayed zeros.
+pub(crate) fn late_uncopied() -> bool {
+    switches()[4].1
 }
 
 /// Logs the switches, once.
