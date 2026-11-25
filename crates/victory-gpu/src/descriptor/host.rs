@@ -1508,6 +1508,19 @@ fn view_extent() -> bool {
 /// buffer object. The slot then showed a copy nothing brought up to date,
 /// and what shaders wrote through it was looked for in the other copy.
 pub(crate) fn buffer_copy(view: &View) -> Option<(std::sync::Arc<crate::shadow::Shadow>, u64, u64)> {
+    // Lot 6 (`VICTORY_L6_VIEW_COPY`): a view made over a copy of its own
+    // bytes (constant buffers among them) is brought up to date there.
+    if crate::l6::view_copy() {
+        let range = match *view {
+            View::Constant(address, size) => Some((address, u64::from(size))),
+            _ => buffer_range(view),
+        };
+        if let Some((address, len)) = range
+            && let Some(own) = crate::shadow::exact(view, address, len, false)
+        {
+            return Some((own, address, len));
+        }
+    }
     let (address, len) = buffer_range(view)?;
     if len == 0 {
         return None;
@@ -1604,12 +1617,50 @@ fn buffer_view_ok(format: DXGI_FORMAT, first: u64, count: u32, stride: u32, raw:
 }
 
 fn buffer_srv(
+    view: &View,
     address: u64,
     len: u64,
-    mut desc: D3D12_SHADER_RESOURCE_VIEW_DESC,
+    desc: D3D12_SHADER_RESOURCE_VIEW_DESC,
     at: D3D12_CPU_DESCRIPTOR_HANDLE,
 ) -> Option<Kept> {
     let shadow = crate::shadow::find(address, len)?;
+    buffer_srv_on(view, &shadow, address, desc, at, true)
+}
+
+/// Lot 6 (`VICTORY_L6_VIEW_COPY`): shader resource view `view` of the
+/// buffer at `address` (`desc` as the title described it), which cannot
+/// start where it lies in its buffer's host copy, made over a copy of its
+/// own bytes ([`crate::shadow::exact`]); `None` if it cannot have one.
+fn own_srv(
+    view: &View,
+    address: u64,
+    desc: D3D12_SHADER_RESOURCE_VIEW_DESC,
+    at: D3D12_CPU_DESCRIPTOR_HANDLE,
+) -> Option<Option<Kept>> {
+    if !crate::l6::view_copy() {
+        return None;
+    }
+    let element = element_size(&desc);
+    // SAFETY: a buffer view's union member.
+    let buffer = unsafe { desc.Anonymous.Buffer };
+    let start = address.checked_add(buffer.FirstElement.checked_mul(element)?)?;
+    let shadow = crate::shadow::exact(view, start, u64::from(buffer.NumElements) * element, true)?;
+    let mut desc = desc;
+    desc.Anonymous.Buffer.FirstElement = 0;
+    Some(buffer_srv_on(view, &shadow, start, desc, at, false))
+}
+
+/// [`buffer_srv`] over host copy `shadow`; `own`: a view that cannot be
+/// made over it may be made over a copy of its own.
+fn buffer_srv_on(
+    view: &View,
+    shadow: &std::sync::Arc<crate::shadow::Shadow>,
+    address: u64,
+    mut desc: D3D12_SHADER_RESOURCE_VIEW_DESC,
+    at: D3D12_CPU_DESCRIPTOR_HANDLE,
+    own: bool,
+) -> Option<Kept> {
+    let titles = desc;
     let offset = shadow.offset(address);
     // A structured view as a raw view of the same bytes (see `raw_window`).
     // SAFETY: a buffer view's union member.
@@ -1631,6 +1682,9 @@ fn buffer_srv(
     let buffer = unsafe { &mut desc.Anonymous.Buffer };
     if window.is_none() {
         if element == 0 || offset % element != 0 {
+            if own && let Some(kept) = own_srv(view, address, titles, at) {
+                return kept;
+            }
             crate::l6::add(crate::l6::OFF_ELEMENT, 1);
             once!(
                 offset,
@@ -1646,6 +1700,10 @@ fn buffer_srv(
     // SAFETY: a live buffer.
     let width = unsafe { shadow.buffer.GetDesc() }.Width;
     if !buffer_view_ok(desc.Format, first, count, stride, raw, width) {
+        // (A raw view not on 16 bytes of the copy, one past its end.)
+        if own && let Some(kept) = own_srv(view, address, titles, at) {
+            return kept;
+        }
         REFUSED_VIEWS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         crate::l6::add(crate::l6::REFUSED, 1);
         once!(
@@ -1678,12 +1736,53 @@ fn buffer_srv(
 /// shortcut: what shaders write stays in the host copy; title memory (and
 /// so the CPU, and copies run on the CPU) does not see it.
 fn buffer_uav(
+    view: &View,
     address: u64,
     len: u64,
-    mut desc: D3D12_UNORDERED_ACCESS_VIEW_DESC,
+    desc: D3D12_UNORDERED_ACCESS_VIEW_DESC,
     at: D3D12_CPU_DESCRIPTOR_HANDLE,
 ) -> Option<Kept> {
     let shadow = crate::shadow::find(address, len)?;
+    buffer_uav_on(view, &shadow, address, desc, at, true)
+}
+
+/// Lot 6 (`VICTORY_L6_VIEW_COPY`): [`own_srv`] for an unordered access
+/// view.
+fn own_uav(
+    view: &View,
+    address: u64,
+    desc: D3D12_UNORDERED_ACCESS_VIEW_DESC,
+    at: D3D12_CPU_DESCRIPTOR_HANDLE,
+) -> Option<Option<Kept>> {
+    if !crate::l6::view_copy() {
+        return None;
+    }
+    // SAFETY: a buffer view's union member.
+    let buffer = unsafe { desc.Anonymous.Buffer };
+    let element = if buffer.StructureByteStride > 0 {
+        u64::from(buffer.StructureByteStride)
+    } else if buffer.Flags.0 & D3D12_BUFFER_UAV_FLAG_RAW.0 != 0 {
+        4
+    } else {
+        crate::resource::element(desc.Format.0 as u32).map_or(0, |(bytes, _)| bytes)
+    };
+    let start = address.checked_add(buffer.FirstElement.checked_mul(element)?)?;
+    let shadow = crate::shadow::exact(view, start, u64::from(buffer.NumElements) * element, true)?;
+    let mut desc = desc;
+    desc.Anonymous.Buffer.FirstElement = 0;
+    Some(buffer_uav_on(view, &shadow, start, desc, at, false))
+}
+
+/// [`buffer_uav`] over host copy `shadow`, as [`buffer_srv_on`].
+fn buffer_uav_on(
+    view: &View,
+    shadow: &std::sync::Arc<crate::shadow::Shadow>,
+    address: u64,
+    mut desc: D3D12_UNORDERED_ACCESS_VIEW_DESC,
+    at: D3D12_CPU_DESCRIPTOR_HANDLE,
+    own: bool,
+) -> Option<Kept> {
+    let titles = desc;
     // SAFETY: a live buffer.
     let flags = unsafe { shadow.buffer.GetDesc() }.Flags;
     if flags.0 & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS.0 == 0 {
@@ -1711,6 +1810,9 @@ fn buffer_uav(
         buffer.Flags = D3D12_BUFFER_UAV_FLAG_RAW;
     } else {
         if element == 0 || offset % element != 0 {
+            if own && let Some(kept) = own_uav(view, address, titles, at) {
+                return kept;
+            }
             crate::l6::add(crate::l6::OFF_ELEMENT, 1);
             once!(offset, element, "unordered buffer view not on an element of its host copy");
             return None;
@@ -1728,6 +1830,9 @@ fn buffer_uav(
     // SAFETY: a live buffer.
     let width = unsafe { shadow.buffer.GetDesc() }.Width;
     if !buffer_view_ok(desc.Format, first, count, stride, raw, width) {
+        if own && let Some(kept) = own_uav(view, address, titles, at) {
+            return kept;
+        }
         REFUSED_VIEWS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         crate::l6::add(crate::l6::REFUSED, 1);
         once!(
@@ -1888,8 +1993,17 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
     let device = &host.device;
     match view {
         &View::Constant(address, size) => {
-            let shadow = crate::shadow::find(address, u64::from(size))?;
-            let gpu = shadow.gpu(address);
+            let mut shadow = crate::shadow::find(address, u64::from(size))?;
+            let mut gpu = shadow.gpu(address);
+            // Lot 6 (`VICTORY_L6_VIEW_COPY`): over a copy of its own bytes,
+            // which starts on 256 (the console takes 16).
+            if gpu % 256 != 0
+                && crate::l6::view_copy()
+                && let Some(own) = crate::shadow::exact(view, address, u64::from(size), true)
+            {
+                gpu = own.gpu(address);
+                shadow = own;
+            }
             if gpu % 256 != 0 {
                 crate::l6::add(crate::l6::CONSTANT_UNALIGNED, 1);
                 once!(
@@ -1949,7 +2063,7 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
             } else if let (Some((data, len)), Some(desc)) =
                 (crate::resource::buffer_bytes(resource), desc)
             {
-                buffer_srv(data as u64, len, srv_desc(desc), at)
+                buffer_srv(view, data as u64, len, srv_desc(desc), at)
             } else {
                 None
             }
@@ -1959,7 +2073,7 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
             let Some(texture) = crate::resource::host_resource(resource) else {
                 return match (crate::resource::buffer_bytes(resource), desc) {
                     (Some((data, len)), Some(desc)) => {
-                        buffer_uav(data as u64, len, uav_desc(desc), at)
+                        buffer_uav(view, data as u64, len, uav_desc(desc), at)
                     }
                     _ => None,
                 };
@@ -2043,9 +2157,9 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
             let address = u64::from(desc[10]) | u64::from(desc[11]) << 32;
             let words: &[u32; 10] = desc[..10].try_into().unwrap_or(&[0; 10]);
             if *unordered {
-                buffer_uav(address, len, uav_desc(words), at)
+                buffer_uav(view, address, len, uav_desc(words), at)
             } else {
-                buffer_srv(address, len, srv_desc(words), at)
+                buffer_srv(view, address, len, srv_desc(words), at)
             }
         }
     }
@@ -2339,6 +2453,62 @@ mod tests {
         assert!(!buffer_view_ok(DXGI_FORMAT_R32_TYPELESS, 0, 0, 0, true, 4096));
         // a structured view the host takes as it is
         assert!(buffer_view_ok(DXGI_FORMAT_UNKNOWN, 1, 10, 12, false, 4096));
+    }
+
+    /// Lot 6 (`VICTORY_L6_VIEW_COPY`): a structured view off its copy's
+    /// elements (memory outside buffer objects is copied in windows on a
+    /// grid of their own, which a 456-byte or 12-byte element does not
+    /// divide) and a raw one 8 bytes off 16 are made over a copy of their
+    /// own bytes, which the pass that brings the slot up to date finds too;
+    /// one that the copy of its memory can show still views that copy.
+    #[test]
+    fn views_off_their_copys_elements_get_their_own_copy() {
+        let Some(host) = crate::host::host() else {
+            return; // no host GPU here
+        };
+        // SAFETY: a plain CPU-side heap of one view.
+        let cpu: ID3D12DescriptorHeap = unsafe {
+            host.device.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+                Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+                NumDescriptors: 1,
+                ..Default::default()
+            })
+        }
+        .unwrap();
+        // SAFETY: a live heap.
+        let at = unsafe { cpu.GetCPUDescriptorHandleForHeapStart() };
+        // Title memory: 64 KiB on 64 KiB, inside a bigger allocation.
+        let memory = vec![0u8; 3 << 16];
+        let start = (memory.as_ptr() as u64).next_multiple_of(1 << 16);
+        // A view of `count` elements of `stride` bytes (0: raw dwords) placed
+        // at `address` (resource and view descriptions as the title passes
+        // them to device 0x230).
+        let view = |address: u64, count: u32, stride: u32| {
+            let resource: [u32; 14] = [1, 0, 0, 0, 1 << 16, 0, 1, 1 | 1 << 16, 0, 1, 0, 1, 0, 0];
+            let (format, flags) = if stride == 0 { (39, 1) } else { (0, 0) };
+            let mut desc = [0u32; 16];
+            desc[..10].copy_from_slice(&[format, 1, 5768, 0, 0, 0, count, stride, flags, 0]);
+            (desc[10], desc[11]) = (address as u32, (address >> 32) as u32);
+            View::Placed(false, resource, desc)
+        };
+        let width = |v: &View| {
+            let made = make(v, at)?.expect("a resource");
+            // SAFETY: a live buffer.
+            Some(unsafe { made.GetDesc() }.Width)
+        };
+        let on = crate::l6::view_copy();
+        // On 16 bytes of the copy of its memory (a window on a grid of its
+        // own, not on the title's elements): a raw view over that copy.
+        let fine = width(&view(start + 32, 4, 456));
+        assert!(fine.is_some_and(|w| w != 2048), "{fine:?}");
+        // off: their own bytes (or null with the switch off)
+        for (v, len) in [(view(start + 100, 4, 456), 4 * 456), (view(start + 8, 8, 0), 32)] {
+            assert_eq!(width(&v), on.then(|| (len as u64).next_multiple_of(256)), "{v:?}");
+            let (copy, address, bytes) = buffer_copy(&v).unwrap();
+            assert_eq!((address, bytes), (buffer_range(&v).unwrap().0, len as u64));
+            assert_eq!(copy.offset(address) == 0, on, "the pass refreshes the copy the slot shows");
+        }
+        drop(memory);
     }
 
     /// The queue of textures picked by index serves the slots looked at

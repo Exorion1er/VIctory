@@ -2736,6 +2736,65 @@ pub(crate) fn find(address: u64, len: u64) -> Option<Arc<Shadow>> {
     lookup(address, len, false)
 }
 
+/// Lot 6 (`VICTORY_L6_VIEW_COPY`): copies of single views' bytes, by the
+/// view, with the frame that last asked for each.
+#[allow(clippy::type_complexity)]
+static EXACT: Mutex<BTreeMap<crate::descriptor::View, (Arc<Shadow>, u64)>> = Mutex::new(BTreeMap::new());
+
+/// The most [`EXACT`] keeps. Ring positions change every frame: one not
+/// asked for in the last frames goes when room is needed (the lists and
+/// heap slots using it hold its buffer).
+const EXACT_KEPT: usize = 1024;
+
+/// Lot 6 (`VICTORY_L6_VIEW_COPY`): the copy of its own of the `len` bytes
+/// at `address` that buffer view `view` reads, made if `make` (and there is
+/// room). A console view starts at any address; a host view counts its
+/// first element from its buffer's start, raw views from 16 bytes and
+/// constant buffers from 256. The title places views at ring positions
+/// inside its big buffers (upstream 86a5ed6b: the meshlet culling's
+/// 456-byte constants, the colour bakes' parameter blocks), and such a
+/// view, made over its buffer's copy, was left null: its shaders read
+/// zeros, every meshlet culled. Over a copy that starts at its address it
+/// starts on everything. The slot made over it and the passes that bring
+/// it up to date find the same copy by the view.
+pub(crate) fn exact(view: &crate::descriptor::View, address: u64, len: u64, make: bool) -> Option<Arc<Shadow>> {
+    if len == 0 {
+        return None;
+    }
+    let frame = crate::frame::current();
+    let mut map = EXACT.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some((shadow, used)) = map.get_mut(view) {
+        *used = frame;
+        return Some(shadow.clone());
+    }
+    if !make {
+        return None;
+    }
+    if map.len() >= EXACT_KEPT {
+        let oldest = map
+            .iter()
+            .min_by_key(|(_, (_, used))| *used)
+            .map(|(k, (_, used))| (k.clone(), *used));
+        match oldest {
+            Some((key, used)) if used + 2 < frame => {
+                map.remove(&key);
+            }
+            _ => {
+                crate::l6::add(crate::l6::OWN_REFUSED, 1);
+                return None;
+            }
+        }
+    }
+    let (buffer, data) = host()?.shared_buffer(len.next_multiple_of(256))?;
+    crate::host::name(&buffer, || format!("title view {address:#x}+{len:#x}"));
+    // SAFETY: a live buffer.
+    let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+    let shadow = Arc::new(Shadow::new(buffer, data, gpu, address, len));
+    map.insert(view.clone(), (shadow.clone(), frame));
+    crate::l6::add(crate::l6::OWN_COPIES, 1);
+    Some(shadow)
+}
+
 /// As [`find`], for an ask that is done with the copy when its list has
 /// run (a draw's vertex and index buffers, indirect arguments): outside
 /// buffer objects it takes a window that is there already and holds the
