@@ -4364,6 +4364,7 @@ impl Host {
         crate::l6::announce();
         crate::l7::announce();
         crate::l7perf::announce();
+        crate::l8ww::announce();
         crate::l7unlit::announce();
         // Descriptors the title copied into its heaps itself (lot 6,
         // `VICTORY_L6_HEAP_SYNC`), before anything of this submission is
@@ -5917,7 +5918,9 @@ fn read_sparse(src: *const u8, dst: *mut u8, len: usize) {
         let remaining = len - offset;
         // SAFETY: the query inspects an address and fills a local structure.
         let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
-        let size = unsafe { VirtualQuery(at.cast(), &mut info, size_of_val(&info)) };
+        let size = crate::l8ww::timed(crate::l8ww::Site::Query, || unsafe {
+            VirtualQuery(at.cast(), &mut info, size_of_val(&info))
+        });
         let n = (info.BaseAddress as usize).saturating_add(info.RegionSize)
             .saturating_sub(at as usize).min(remaining);
         if size != size_of_val(&info) || n == 0 {
@@ -5970,7 +5973,9 @@ fn read(src: *const u8, dst: *mut u8, len: usize) -> bool {
     let mut done = 0;
     // SAFETY: the destination is mapped writable memory of `len` bytes; the
     // kernel checks the source.
-    unsafe { ReadProcessMemory(GetCurrentProcess(), src.cast(), dst.cast(), len, &mut done) != 0 }
+    crate::l8ww::timed(crate::l8ww::Site::Read, || unsafe {
+        ReadProcessMemory(GetCurrentProcess(), src.cast(), dst.cast(), len, &mut done) != 0
+    })
 }
 
 #[link(name = "ntdll", kind = "raw-dylib")]
@@ -6273,6 +6278,8 @@ impl Meter {
         crate::l6::log(frames);
         // Lot 7: what its switches did.
         crate::l7::log(frames);
+        // Lot 8: what tracking title memory asked of the system.
+        crate::l8ww::log(frames);
         // Lot 7: what the unlit pass did.
         crate::l7unlit::log(frames);
         // Passes over the heap's buffer views for shaders that pick them by index.

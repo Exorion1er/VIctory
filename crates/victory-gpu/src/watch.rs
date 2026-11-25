@@ -254,6 +254,7 @@ fn ask_kernel(j: &mut Journal, first: usize, last: usize) -> bool {
     let mut granularity = 0;
     #[cfg(feature = "diagnostics")]
     let started = std::time::Instant::now();
+    let asking = std::time::Instant::now();
     // SAFETY: the answer buffer holds `count` entries.
     let failed = unsafe {
         GetWriteWatch(
@@ -265,6 +266,10 @@ fn ask_kernel(j: &mut Journal, first: usize, last: usize) -> bool {
             &mut granularity,
         )
     } != 0;
+    crate::l8ww::add_call(
+        if failed { crate::l8ww::Site::WatchFailed } else { crate::l8ww::Site::WatchOk },
+        asking.elapsed().as_micros() as u64,
+    );
     if failed {
         return false;
     }
@@ -306,7 +311,9 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
     use windows_sys::Win32::System::Memory::GetWriteWatch;
     const WRITE_WATCH_FLAG_RESET: u32 = 1;
     let (first, last) = (start / PAGE, end.div_ceil(PAGE));
-    let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
+    let mut j = crate::l8ww::waited(crate::l8ww::Count::JournalWaitUs, || {
+        JOURNAL.lock().unwrap_or_else(|e| e.into_inner())
+    });
     let j = &mut *j;
     // Asked ahead with the submission's other ranges: the journal has it.
     if j.ahead.iter().any(|&(a, b)| a <= first && last <= b) {
@@ -323,6 +330,7 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
     let mut granularity = 0;
     #[cfg(feature = "diagnostics")]
     let started = std::time::Instant::now();
+    let asking = std::time::Instant::now();
     // SAFETY: the answer buffer holds `count` entries.
     let failed = unsafe {
         GetWriteWatch(
@@ -334,6 +342,10 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
             &mut granularity,
         )
     } != 0;
+    crate::l8ww::add_call(
+        if failed { crate::l8ww::Site::WatchFailed } else { crate::l8ww::Site::WatchOk },
+        asking.elapsed().as_micros() as u64,
+    );
     let guarded = if failed {
         count = 0;
         if !guarded {
@@ -381,22 +393,35 @@ struct Guards {
     /// Blocks already copied as zeros. While they remain wholly uncommitted,
     /// the copy can skip hundreds of MB of failing kernel reads per world frame.
     absent: BTreeSet<usize>,
+    /// The frame and the blocks that faulted in it (counted, `crate::l8ww`).
+    faulted: (u64, BTreeSet<usize>),
 }
 
 static GUARDS: Mutex<Guards> = Mutex::new(Guards {
     protected: BTreeSet::new(),
     clean: BTreeSet::new(),
     absent: BTreeSet::new(),
+    faulted: (0, BTreeSet::new()),
 });
 
 fn guards() -> std::sync::MutexGuard<'static, Guards> {
     GUARDS.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// [`guards`] for the title's threads and the runtime's mappings, the wait
+/// counted.
+fn guards_waited() -> std::sync::MutexGuard<'static, Guards> {
+    crate::l8ww::waited(crate::l8ww::Count::GuardsWaitUs, guards)
+}
+
 /// For view memory: the pages of `[start, end)`'s blocks written since
 /// they were last guarded (all of a block's pages), guarding them again
 /// before the caller copies them. `None` if the memory is not a view.
 fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
+    crate::l8ww::timed(crate::l8ww::Site::Guard, || guard_timed(start, end))
+}
+
+fn guard_timed(start: usize, end: usize) -> Option<Vec<usize>> {
     // A range whose first block the guards hold already (read-only by our
     // hand, or noted absent) is a view: no question to Windows. The
     // question walks the page tables to the end of the pages that share the
@@ -487,7 +512,9 @@ fn is_view(start: usize, end: usize) -> bool {
         // SAFETY: plain data filled in by the query.
         let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
         // SAFETY: a valid out pointer of the right size.
-        let n = unsafe { VirtualQuery(at as *const _, &mut info, size_of_val(&info)) };
+        let n = crate::l8ww::timed(crate::l8ww::Site::Query, || unsafe {
+            VirtualQuery(at as *const _, &mut info, size_of_val(&info))
+        });
         if n == 0 {
             return false;
         }
@@ -535,14 +562,14 @@ fn protect_here(g: &mut Guards, from: usize, to: usize) {
     let set = |from: usize, to: usize| {
         let mut old = 0;
         // SAFETY: title view memory; only its protection changes.
-        unsafe {
+        crate::l8ww::timed(crate::l8ww::Site::Protect, || unsafe {
             VirtualProtect(
                 (from * BLOCK) as *const _,
                 (to - from) * BLOCK,
                 PAGE_READONLY,
                 &mut old,
             ) != 0
-        }
+        })
     };
     let note = |g: &mut Guards, from: usize, to: usize| {
         g.protected.extend(from..to);
@@ -569,7 +596,9 @@ fn uncommitted_end(block: usize) -> usize {
     // SAFETY: plain data filled in by the query.
     let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
     // SAFETY: a valid out pointer of the right size.
-    let n = unsafe { VirtualQuery((block * BLOCK) as *const _, &mut info, size_of_val(&info)) };
+    let n = crate::l8ww::timed(crate::l8ww::Site::Query, || unsafe {
+        VirtualQuery((block * BLOCK) as *const _, &mut info, size_of_val(&info))
+    });
     if n != 0 && matches!(info.State, MEM_RESERVE | MEM_FREE) {
         (info.BaseAddress as usize).saturating_add(info.RegionSize) / BLOCK
     } else {
@@ -611,7 +640,9 @@ fn open_here(g: &mut Guards, start: usize, end: usize) -> bool {
         g.clean.remove(&block);
         let mut old = 0;
         // SAFETY: a block we made read-only.
-        unsafe { VirtualProtect((block * BLOCK) as *const _, BLOCK, PAGE_READWRITE, &mut old) };
+        crate::l8ww::timed(crate::l8ww::Site::Open, || unsafe {
+            VirtualProtect((block * BLOCK) as *const _, BLOCK, PAGE_READWRITE, &mut old)
+        });
     }
     !blocks.is_empty()
 }
@@ -622,7 +653,7 @@ fn open_here(g: &mut Guards, start: usize, end: usize) -> bool {
 /// reads into its own memory.
 pub fn writing(at: usize, len: usize) {
     // The length is the title's (`fread`'s size times count, saturated).
-    open(&mut guards(), at, at.saturating_add(len));
+    open(&mut guards_waited(), at, at.saturating_add(len));
     // A placed texture there changes with no descriptor written.
     crate::descriptor::host::remapped(at, len);
 }
@@ -637,7 +668,7 @@ pub(crate) fn views_mapped(section: usize, offset: u64, len: usize) {
     if ranges.is_empty() {
         return;
     }
-    let mut g = guards();
+    let mut g = guards_waited();
     for &(at, n) in &ranges {
         open_here(&mut g, at, at.saturating_add(n));
     }
@@ -658,7 +689,7 @@ pub fn title_memory_written(section: usize, offset: u64, len: usize) {
     {
         // Every view of the bytes is opened here, so no other view of them
         // has to be looked for.
-        let mut g = guards();
+        let mut g = guards_waited();
         for &(at, n) in &ranges {
             open_here(&mut g, at, at.saturating_add(n));
         }
@@ -729,7 +760,7 @@ pub fn title_memory_remapped(at: usize, len: usize) {
     crate::inplace::views_gone(at, len);
     // And nothing stays in place over it.
     crate::inplace::title_memory_freeing(at, len);
-    let mut g = guards();
+    let mut g = guards_waited();
     let range = at / BLOCK..at.saturating_add(len).div_ceil(BLOCK);
     let absent: Vec<usize> = g.absent.range(range.clone()).copied().collect();
     for block in absent {
@@ -761,13 +792,23 @@ fn install() {
             return EXCEPTION_CONTINUE_SEARCH;
         }
         let at = r.ExceptionInformation[1];
+        let started = std::time::Instant::now();
         // Held across both checks: another thread may have opened the block
         // since this one faulted, and a copy may have guarded it again since
         // (then it is ours again, not read-only for some other reason).
-        let mut g = guards();
+        let mut g = guards_waited();
         if open(&mut g, at, at + 1) {
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::GuardFaults, 1);
+            let frame = crate::frame::current();
+            if g.faulted.0 != frame {
+                g.faulted = (frame, BTreeSet::new());
+            }
+            if !g.faulted.1.insert(at / BLOCK) {
+                crate::l8ww::add(crate::l8ww::Count::FaultsAgain, 1);
+            }
+            drop(g);
+            crate::l8ww::add_call(crate::l8ww::Site::Fault, started.elapsed().as_micros() as u64);
             return EXCEPTION_CONTINUE_EXECUTION;
         }
         if writable(at) {
@@ -791,7 +832,9 @@ fn writable(at: usize) -> bool {
     // SAFETY: plain data filled in by the query.
     let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
     // SAFETY: a valid out pointer of the right size.
-    let n = unsafe { VirtualQuery(at as *const _, &mut info, size_of_val(&info)) };
+    let n = crate::l8ww::timed(crate::l8ww::Site::Query, || unsafe {
+        VirtualQuery(at as *const _, &mut info, size_of_val(&info))
+    });
     n != 0 && info.State == MEM_COMMIT && info.Protect == PAGE_READWRITE
 }
 
