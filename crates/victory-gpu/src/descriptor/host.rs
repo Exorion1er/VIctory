@@ -2742,6 +2742,76 @@ pub(crate) fn placed_texture(view: &View) -> Option<View> {
     }
 }
 
+/// With `VICTORY_NULL_MAGENTA=1`, a 2D colour texture view that shows
+/// nothing yet shows magenta: on the screen, a texture that is not there is
+/// told from one whose contents are black. False if it is to be null.
+#[cfg(feature = "diagnostics")]
+fn magenta_for(desc: &[u32; 16], at: D3D12_CPU_DESCRIPTOR_HANDLE) -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ON.get_or_init(|| std::env::var_os("VICTORY_NULL_MAGENTA").is_some_and(|v| v == "1")) {
+        return false;
+    }
+    // Block-compressed colour (BC1 to BC3, BC7) and 8-bit RGBA and BGRA.
+    let colour = matches!(desc[0], 27..=29 | 70..=78 | 87..=91 | 97..=99);
+    if desc[1] != D3D12_SRV_DIMENSION_TEXTURE2D.0 as u32 || !colour {
+        return false;
+    }
+    let (Some(host), Some(texture)) = (host(), magenta()) else {
+        return false;
+    };
+    // SAFETY: a slot of our heap and a live texture.
+    unsafe { host.device.CreateShaderResourceView(texture, None, at) };
+    true
+}
+
+/// One magenta texel, written by the processor.
+#[cfg(feature = "diagnostics")]
+fn magenta() -> Option<&'static ID3D12Resource> {
+    static TEXTURE: std::sync::OnceLock<Option<ID3D12Resource>> = std::sync::OnceLock::new();
+    TEXTURE
+        .get_or_init(|| {
+            let heap = D3D12_HEAP_PROPERTIES {
+                Type: D3D12_HEAP_TYPE_CUSTOM,
+                CPUPageProperty: D3D12_CPU_PAGE_PROPERTY_WRITE_BACK,
+                MemoryPoolPreference: D3D12_MEMORY_POOL_L0,
+                ..Default::default()
+            };
+            let desc = D3D12_RESOURCE_DESC {
+                Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+                Width: 1,
+                Height: 1,
+                DepthOrArraySize: 1,
+                MipLevels: 1,
+                Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+                SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                ..Default::default()
+            };
+            let mut texture: Option<ID3D12Resource> = None;
+            // SAFETY: valid descriptions and an out pointer; the texel is
+            // written while nothing reads the texture.
+            unsafe {
+                host()?
+                    .device
+                    .CreateCommittedResource(
+                        &heap,
+                        D3D12_HEAP_FLAG_NONE,
+                        &desc,
+                        D3D12_RESOURCE_STATE_COMMON,
+                        None,
+                        &mut texture,
+                    )
+                    .ok()?;
+                let texture = texture?;
+                texture.Map(0, None, None).ok()?;
+                let texel = [255u8, 0, 255, 255];
+                texture.WriteToSubresource(0, None, texel.as_ptr().cast(), 4, 4).ok()?;
+                texture.Unmap(0, None);
+                Some(texture)
+            }
+        })
+        .as_ref()
+}
+
 /// A null view of the kind `view` is, for a slot whose view the host
 /// cannot make: unordered access (to a buffer or a 2D texture) or a shader
 /// view. Writes to it are dropped, reads give zeros.
@@ -2767,6 +2837,10 @@ fn null_for(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) {
         // cubes), not always 2D.
         View::Shader(_, Some(desc)) => return null_like(desc, at),
         View::Placed(false, _, desc) => {
+            #[cfg(feature = "diagnostics")]
+            if magenta_for(desc, at) {
+                return;
+            }
             return null_like(desc[..10].try_into().unwrap_or(&[0; 10]), at);
         }
         View::Constant(..) => {
@@ -2958,6 +3032,23 @@ mod tests {
         let View::Placed(_, resource, desc) = low.clone() else { unreachable!() };
         assert!(!same_placed_texture(&low, &View::Placed(true, resource, desc)));
         assert!(!same_placed_texture(&low, &View::Shader(0, None)));
+    }
+
+    /// The texture that stands for missing ones can be made and viewed.
+    #[cfg(feature = "diagnostics")]
+    #[test]
+    fn a_magenta_texture_is_made() {
+        let Some(host) = host() else {
+            return; // no host GPU
+        };
+        let Some(heap) = HostHeap::new(false, 4) else {
+            return;
+        };
+        let texture = magenta().expect("the texture");
+        // SAFETY: a slot of our heap and a live texture.
+        unsafe { host.device.CreateShaderResourceView(texture, None, heap.cpu(0)) };
+        // SAFETY: a plain device query.
+        assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
     }
 
     /// A null 3D UAV made on the real device leaves it alive.
