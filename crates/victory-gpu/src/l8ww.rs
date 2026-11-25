@@ -12,7 +12,7 @@
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 
 /// The switches: name, on by default.
-const SWITCHES: &[(&str, bool)] = &[("WW_KNOWN_VIEWS", true), ("WW_ABSENT_TRUST", true), ("WW_BY_RESERVATION", false), ("WW_PROTECT_RUNS", true)];
+const SWITCHES: &[(&str, bool)] = &[("WW_KNOWN_VIEWS", true), ("WW_ABSENT_TRUST", true), ("WW_BY_RESERVATION", false), ("WW_PROTECT_RUNS", true), ("GUARD_REARM_FRAME", false)];
 
 /// Whether switch `name` (`VICTORY_L8_<name>`) is on.
 fn read(name: &str, default: bool) -> bool {
@@ -98,6 +98,18 @@ pub(crate) fn protect_runs() -> bool {
     on("WW_PROTECT_RUNS")
 }
 
+/// `VICTORY_L8_GUARD_REARM_FRAME` (off): a guarded block the title writes
+/// again after its guard was armed again in the same frame is left open
+/// until the next frame: every check in the meantime reports it written
+/// (and its copy takes it again), with no more faults nor protection
+/// changes for it in that frame. Worth it only where the line's "faulted
+/// earlier in the frame" count is high: each fault under Wine is a signal,
+/// an exception dispatch and two protection changes on the title's thread,
+/// against a 64 KiB copy per check of the block.
+pub(crate) fn rearm_frame() -> bool {
+    on("GUARD_REARM_FRAME")
+}
+
 /// Whether we run under Wine (its ntdll exports `wine_get_version`).
 pub(crate) fn on_wine() -> bool {
     static WINE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -157,9 +169,11 @@ pub(crate) enum Count {
     /// `VirtualQuery` calls not made: blocks known unmapped
     /// ([`absent_trust`]).
     QueriesSkipped,
+    /// Guards left open until the next frame ([`rearm_frame`]).
+    RearmDeferred,
 }
 
-const COUNTS: usize = 5;
+const COUNTS: usize = 6;
 
 static COUNT: [AtomicU64; COUNTS] = [const { AtomicU64::new(0) }; COUNTS];
 
@@ -222,11 +236,13 @@ pub(crate) fn line(frames: f64) -> String {
          {open:.0} read-write {open_ms:.2} ms; VirtualQuery {query:.0} {query_ms:.2} ms ({:.0} not made: \
          blocks known unmapped, WW_ABSENT_TRUST); QueryWorkingSetEx \
          {set:.0} {set_ms:.2} ms; ReadProcessMemory {read:.0} {read_ms:.2} ms; guard faults {fault:.0} \
-         ({:.0} on a block that faulted earlier in the frame) {fault_ms:.2} ms in the handler; waits for our \
+         ({:.0} on a block that faulted earlier in the frame) {fault_ms:.2} ms in the handler, {:.0} guards \
+         left open to the next frame (GUARD_REARM_FRAME); waits for our \
          locks: guards {:.2} ms, write-watch journal {:.2} ms",
         c[Count::WatchesSkipped as usize],
         c[Count::QueriesSkipped as usize],
         c[Count::FaultsAgain as usize],
+        c[Count::RearmDeferred as usize],
         c[Count::GuardsWaitUs as usize] / 1e3,
         c[Count::JournalWaitUs as usize] / 1e3,
     )

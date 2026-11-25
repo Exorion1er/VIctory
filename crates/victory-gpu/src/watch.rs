@@ -462,16 +462,31 @@ struct Guards {
     /// Blocks already copied as zeros. While they remain wholly uncommitted,
     /// the copy can skip hundreds of MB of failing kernel reads per world frame.
     absent: BTreeSet<usize>,
-    /// The frame and the blocks that faulted in it (counted, `crate::l8ww`).
-    faulted: (u64, BTreeSet<usize>),
+    /// The frame and the blocks that faulted in it, with how many times
+    /// (counted, `crate::l8ww`; `crate::l8ww::rearm_frame`).
+    faulted: (u64, BTreeMap<usize, u32>),
 }
 
 static GUARDS: Mutex<Guards> = Mutex::new(Guards {
     protected: BTreeSet::new(),
     clean: BTreeSet::new(),
     absent: BTreeSet::new(),
-    faulted: (0, BTreeSet::new()),
+    faulted: (0, BTreeMap::new()),
 });
+
+/// With `crate::l8ww::rearm_frame`: whether written `block` stays open
+/// (not armed again) until the next frame, because the title's writes
+/// faulted on it twice or more in this one.
+fn rearm_deferred(g: &mut Guards, block: usize) -> bool {
+    if !crate::l8ww::rearm_frame()
+        || g.faulted.0 != crate::frame::current()
+        || g.faulted.1.get(&block).is_none_or(|&n| n < 2)
+    {
+        return false;
+    }
+    crate::l8ww::add(crate::l8ww::Count::RearmDeferred, 1);
+    true
+}
 
 fn guards() -> std::sync::MutexGuard<'static, Guards> {
     GUARDS.lock().unwrap_or_else(|e| e.into_inner())
@@ -556,7 +571,7 @@ fn guard_timed(start: usize, end: usize) -> Option<Vec<usize>> {
             if g.protected.contains(&block) {
                 // Written through the runtime, still read-only.
                 g.clean.insert(block);
-            } else {
+            } else if !rearm_deferred(&mut g, block) {
                 run.get_or_insert(block);
                 continue;
             }
@@ -943,10 +958,15 @@ pub fn title_memory_remapped(at: usize, len: usize) {
     for block in absent {
         g.absent.remove(&block);
     }
-    let blocks: Vec<usize> = g.protected.range(range).copied().collect();
+    let blocks: Vec<usize> = g.protected.range(range.clone()).copied().collect();
     for block in blocks {
         g.protected.remove(&block);
         g.clean.remove(&block);
+    }
+    // New memory: its faults so far were another's.
+    let faulted: Vec<usize> = g.faulted.1.range(range).map(|(&b, _)| b).collect();
+    for block in faulted {
+        g.faulted.1.remove(&block);
     }
 }
 
@@ -979,9 +999,11 @@ fn install() {
             crate::copystat::add(crate::copystat::C::GuardFaults, 1);
             let frame = crate::frame::current();
             if g.faulted.0 != frame {
-                g.faulted = (frame, BTreeSet::new());
+                g.faulted = (frame, BTreeMap::new());
             }
-            if !g.faulted.1.insert(at / BLOCK) {
+            let n = g.faulted.1.entry(at / BLOCK).or_insert(0);
+            *n += 1;
+            if *n > 1 {
                 crate::l8ww::add(crate::l8ww::Count::FaultsAgain, 1);
             }
             drop(g);
@@ -1297,6 +1319,33 @@ mod tests {
         ask_once_end();
         // The reservation stays (see `drop_placeholder`); forgotten here.
         title_memory_reserved(p, SIZE, false, false);
+    }
+
+    /// A block the title writes again and again within a frame is reported
+    /// written at every check after each write, with its guard armed again
+    /// each time or left open until the next frame
+    /// (`VICTORY_L8_GUARD_REARM_FRAME`), and nothing else is.
+    #[test]
+    fn a_block_written_again_in_a_frame_is_reported_at_every_check() {
+        let (p, section) = placeholder(2);
+        map_block(p, section, 0);
+        map_block(p, section, 1);
+        let (start, end) = (p, p + 2 * BLOCK);
+        let fresh = || -> Vec<usize> {
+            let (now, w) = writes(start, end, true).unwrap();
+            w.iter().filter(|&&(_, at)| at == now).map(|&(page, _)| page).collect()
+        };
+        assert_eq!(fresh().len(), 2);
+        assert!(fresh().is_empty());
+        for round in 0..4 {
+            // SAFETY: inside the mapped second block.
+            unsafe { ((p + BLOCK + 8 + round) as *mut u8).write_volatile(1) };
+            assert_eq!(fresh(), [(p + BLOCK) / PAGE], "round {round}");
+        }
+        if !crate::l8ww::rearm_frame() {
+            assert!(fresh().is_empty());
+        }
+        drop_placeholder(p, section, 2, &[0, 1]);
     }
 
     /// A placeholder of `blocks` blocks and a pagefile section as big,
