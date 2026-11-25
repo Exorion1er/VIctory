@@ -717,6 +717,7 @@ impl State {
             _ => 0,
         };
         if address == 0 {
+            crate::l6::add(crate::l6::VIEW_ADDRESS_ZERO, 1);
             once!(slot, dword, "a shader takes the address of a buffer view that is not there: it reads 0");
         }
         if kind == USER_VIEW_ADDRESS {

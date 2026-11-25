@@ -1587,6 +1587,7 @@ fn buffer_srv(
     let buffer = unsafe { &mut desc.Anonymous.Buffer };
     if window.is_none() {
         if element == 0 || offset % element != 0 {
+            crate::l6::add(crate::l6::OFF_ELEMENT, 1);
             once!(
                 offset,
                 element,
@@ -1602,6 +1603,7 @@ fn buffer_srv(
     let width = unsafe { shadow.buffer.GetDesc() }.Width;
     if !buffer_view_ok(desc.Format, first, count, stride, raw, width) {
         REFUSED_VIEWS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        crate::l6::add(crate::l6::REFUSED, 1);
         once!(
             format = desc.Format.0,
             first,
@@ -1665,6 +1667,7 @@ fn buffer_uav(
         buffer.Flags = D3D12_BUFFER_UAV_FLAG_RAW;
     } else {
         if element == 0 || offset % element != 0 {
+            crate::l6::add(crate::l6::OFF_ELEMENT, 1);
             once!(offset, element, "unordered buffer view not on an element of its host copy");
             return None;
         }
@@ -1682,6 +1685,7 @@ fn buffer_uav(
     let width = unsafe { shadow.buffer.GetDesc() }.Width;
     if !buffer_view_ok(desc.Format, first, count, stride, raw, width) {
         REFUSED_VIEWS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        crate::l6::add(crate::l6::REFUSED, 1);
         once!(
             format = desc.Format.0,
             first,
@@ -1843,6 +1847,7 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
             let shadow = crate::shadow::find(address, u64::from(size))?;
             let gpu = shadow.gpu(address);
             if gpu % 256 != 0 {
+                crate::l6::add(crate::l6::CONSTANT_UNALIGNED, 1);
                 once!(
                     address = format_args!("{address:#x}"),
                     "constant buffer not 256-byte aligned on the host"

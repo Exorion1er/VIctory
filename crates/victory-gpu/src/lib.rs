@@ -30,6 +30,8 @@ pub mod frame;
 #[cfg(windows)]
 mod host;
 #[cfg(windows)]
+mod l6;
+#[cfg(windows)]
 mod indirect;
 #[cfg(windows)]
 mod inplace;
