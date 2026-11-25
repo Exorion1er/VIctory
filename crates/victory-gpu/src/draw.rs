@@ -199,6 +199,11 @@ pub(crate) struct State {
     root_uav_slots: std::collections::HashMap<(usize, u64), RootSlot>,
     /// The list ran and its dynamic slots were given back.
     tables_gone: bool,
+    /// Lot 7 (`crate::l7`): the render target handles last noted as a
+    /// G-buffer's, and the frame and first target of the last unlit pass
+    /// asked for in this list, with whether it was recorded.
+    l7_noted: Vec<u64>,
+    l7_done: (u64, usize, bool),
 }
 
 impl Drop for State {
@@ -798,6 +803,9 @@ impl State {
 
     /// As [`State::prepare`], for draws (`mesh` false) or mesh dispatches.
     fn prepare_for(&mut self, list: &HostList, indexed: bool, mesh: bool) -> bool {
+        if self.l7_unlit(list) {
+            return false;
+        }
         #[cfg(feature = "diagnostics")]
         if crate::pipeline::is_skipped(self.pipeline as This) {
             return false;
@@ -805,6 +813,11 @@ impl State {
         let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
             return false;
         };
+        if crate::l7unlit::fills_gbuffer(crate::pipeline::l7_roles(self.pipeline as This))
+            && self.l7_noted != self.target_handles
+        {
+            self.l7_note_gbuffer();
+        }
         if p.compute || p.mesh != mesh {
             once!(mesh, "a draw or mesh dispatch with another kind of pipeline");
             return false;
@@ -2313,6 +2326,108 @@ impl State {
 }
 
 impl State {
+    /// Lot 7, `VICTORY_L7_UNLIT` (`crate::l7`): before the first lighting
+    /// draw of the frame into a target, the unlit pass. True if the draw is
+    /// then dropped (`replace`, once the pass could be recorded).
+    fn l7_unlit(&mut self, list: &HostList) -> bool {
+        let Some(mode) = crate::l7unlit::unlit_for(crate::pipeline::l7_roles(self.pipeline as This)) else {
+            return false;
+        };
+        let bound = self.l7_bound();
+        let frame = crate::queue::presented() + 1;
+        let first = bound.first.unwrap_or(0);
+        if (self.l7_done.0, self.l7_done.1) != (frame, first) {
+            let done = crate::l7unlit::composite(list, &bound, mode == crate::l7unlit::Unlit::Add);
+            self.l7_done = (frame, first, done);
+            if done {
+                // The pass set its own heap, root signature, pipeline and
+                // topology: the next bind sets the title's again.
+                self.host_pipeline = 0;
+                self.host_roots = [0; 2];
+                self.host_heaps = [0; 2];
+                if self.topology_set {
+                    self.set_topology(list, self.topology);
+                }
+            }
+        }
+        let replaced = mode == crate::l7unlit::Unlit::Replace && self.l7_done.2;
+        if replaced {
+            crate::l7unlit::REPLACED.fetch_add(1, Ordering::Relaxed);
+        }
+        replaced
+    }
+
+    /// The bound render targets' view formats as `set_targets` made the
+    /// views (null views included), the first target, and the depth view.
+    fn l7_bound(&self) -> crate::l7unlit::Bound {
+        let mut formats = Vec::new();
+        let mut first = None;
+        for &h in &self.target_handles {
+            let Some(record) = crate::descriptor::rtv_record(h) else {
+                continue;
+            };
+            let desc = record.desc();
+            if let Some(texture) = crate::resource::host_resource(record.resource) {
+                // SAFETY: a live resource.
+                let format = desc
+                    .map(|d| d.Format)
+                    .filter(|f| f.0 != 0)
+                    .unwrap_or_else(|| unsafe { texture.GetDesc() }.Format);
+                if formats.is_empty() {
+                    first = Some(record.resource as usize);
+                }
+                formats.push(format);
+            } else if let Some(d) = desc.filter(|d| d.Format.0 != 0 && d.ViewDimension.0 != 0) {
+                formats.push(d.Format);
+            }
+        }
+        let depth = crate::descriptor::dsv_record(self.depth_handle).and_then(|record| {
+            let texture = crate::resource::host_resource(record.resource)?;
+            // SAFETY: a live resource.
+            let format = record
+                .depth_desc()
+                .map(|d| d.Format)
+                .filter(|f| f.0 != 0)
+                .unwrap_or_else(|| unsafe { texture.GetDesc() }.Format);
+            Some((format, record.resource as usize))
+        });
+        crate::l7unlit::Bound { formats, first, depth }
+    }
+
+    /// Notes the bound targets as a G-buffer's (`crate::l7unlit::note_gbuffer`):
+    /// two targets or more.
+    fn l7_note_gbuffer(&mut self) {
+        self.l7_noted.clone_from(&self.target_handles);
+        let slots: Vec<crate::l7unlit::Slot> = self
+            .target_handles
+            .iter()
+            .filter_map(|&h| {
+                let record = crate::descriptor::rtv_record(h)?;
+                let texture = crate::resource::host_resource(record.resource)?;
+                let desc = record.desc();
+                // SAFETY: a live resource.
+                let format = desc
+                    .map(|d| d.Format)
+                    .filter(|f| f.0 != 0)
+                    .unwrap_or_else(|| unsafe { texture.GetDesc() }.Format);
+                // SAFETY: the union member the dimension names.
+                let mip = desc
+                    .filter(|d| d.ViewDimension == D3D12_RTV_DIMENSION_TEXTURE2D)
+                    .map_or(0, |d| unsafe { d.Anonymous.Texture2D.MipSlice });
+                Some(crate::l7unlit::Slot {
+                    resource: record.resource as usize,
+                    format: format.0,
+                    mip,
+                })
+            })
+            .collect();
+        if slots.len() >= 2 {
+            crate::l7unlit::note_gbuffer(slots);
+        }
+    }
+}
+
+impl State {
     /// Indirect execution of a one-argument signature of `kind` (PC
     /// numbering: 0 draw, 1 indexed draw, 2 dispatch, 10 mesh dispatch) with
     /// records `stride` bytes apart at title address `arguments`, and the
@@ -2326,6 +2441,11 @@ impl State {
         arguments: u64,
         count: Option<u64>,
     ) -> bool {
+        // Lot 7: a lighting draw the unlit pass replaces (the pass is
+        // recorded first), before the clamp too.
+        if self.l7_unlit(list) {
+            return false;
+        }
         // Skip before the argument clamp can mutate the indirect buffer.
         #[cfg(feature = "diagnostics")]
         if crate::pipeline::is_skipped(self.pipeline as This) {

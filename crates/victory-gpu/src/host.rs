@@ -4364,6 +4364,7 @@ impl Host {
         crate::l6::announce();
         crate::l7::announce();
         crate::l7perf::announce();
+        crate::l7unlit::announce();
         // Descriptors the title copied into its heaps itself (lot 6,
         // `VICTORY_L6_HEAP_SYNC`), before anything of this submission is
         // prepared.
@@ -6272,6 +6273,8 @@ impl Meter {
         crate::l6::log(frames);
         // Lot 7: what its switches did.
         crate::l7::log(frames);
+        // Lot 7: what the unlit pass did.
+        crate::l7unlit::log(frames);
         // Passes over the heap's buffer views for shaders that pick them by index.
         let picked = crate::draw::HEAP_BUFFER_PASSES.swap(0, Ordering::Relaxed) as f64 / frames;
         let picked_ms =

@@ -362,6 +362,9 @@ struct Pipeline {
     /// One of the ray-tracing structure builder's ([`Builder`]).
     #[cfg(windows)]
     builder: bool,
+    /// Its shaders' lot 7 roles (`crate::l7`), looked up at its first use.
+    #[cfg(windows)]
+    l7: OnceLock<u64>,
 }
 const _: () = assert!(offset_of!(Pipeline, packet) == 0x10);
 
@@ -450,7 +453,18 @@ fn skipped_shader(p: &Pipeline) -> Option<&str> {
 
 #[cfg(all(windows, feature = "diagnostics"))]
 pub(crate) fn is_skipped(this: This) -> bool {
-    !this.is_null() && skipped_shader(pipeline(this)).is_some()
+    !this.is_null() && (skipped_shader(pipeline(this)).is_some() || crate::l7unlit::skipped_role(l7_roles(this)).is_some())
+}
+
+/// The lot 7 roles of the shaders of `this` (`crate::l7`), as bits; 0 for
+/// none or no pipeline.
+#[cfg(windows)]
+pub(crate) fn l7_roles(this: This) -> u64 {
+    if this.is_null() {
+        return 0;
+    }
+    let p = pipeline(this);
+    *p.l7.get_or_init(|| crate::l7unlit::mask(p.shaders.iter().map(|s| s.hash.as_str())))
 }
 
 /// Counts a draw or dispatch of `this` intentionally skipped or dropped
@@ -463,6 +477,7 @@ pub(crate) fn note_drop(this: This) {
         let p = pipeline(this);
         skipped_shader(p)
             .map(|hash| format!("skipped shader {hash}"))
+            .or_else(|| crate::l7unlit::skipped_role(l7_roles(this)).map(|role| format!("skipped role {role} (VICTORY_L7_SKIP)")))
             .or_else(|| make::missing(&p.host))
     };
     if let Some(why) = why {
@@ -528,6 +543,8 @@ fn hand_out(
         host,
         #[cfg(windows)]
         builder,
+        #[cfg(windows)]
+        l7: OnceLock::new(),
         shaders,
         bound: std::sync::atomic::AtomicBool::new(false),
     });
