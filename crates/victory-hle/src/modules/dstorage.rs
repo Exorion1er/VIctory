@@ -970,6 +970,9 @@ fn into_destination(
     // place through one view.
     if let Some(mut window) = super::xmem::page_window(pages, offset, len) {
         let filled = fill(window.bytes());
+        // With the bytes in: the title's views of them changed without a
+        // fault of theirs (`victory_gpu`'s guard).
+        window.written();
         drop(window);
         // Written around the title's mapping: tell the GPU side where the
         // title sees these bytes (`wrote_physical`).
