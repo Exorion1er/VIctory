@@ -4184,6 +4184,10 @@ impl Host {
         // and the ranges shaders write are per host copy, not per submission.
         let mut submitted = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
         crate::l6::announce();
+        // Descriptors the title copied into its heaps itself (lot 6,
+        // `VICTORY_L6_HEAP_SYNC`), before anything of this submission is
+        // prepared.
+        crate::descriptor::sync_heaps();
         let was_working = working(true);
         submitting(1, runs.len());
         // Flights in the air ([`late`]): a submission that is waited for

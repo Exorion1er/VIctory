@@ -1319,6 +1319,12 @@ impl HostHeap {
         Some(view)
     }
 
+    /// Whether slot `index` was made from a record (tests).
+    #[cfg(test)]
+    pub(crate) fn made(&self, index: u32) -> bool {
+        self.made.lock().unwrap_or_else(|e| e.into_inner())[index as usize] != 0
+    }
+
     /// Whether host slot `index` shows `buffer`; `None` if it shows no
     /// resource (diagnostics: a buffer view's slot must show the host copy
     /// that is brought up to date for it).

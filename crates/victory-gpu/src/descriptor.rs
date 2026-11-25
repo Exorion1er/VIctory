@@ -59,6 +59,13 @@ pub(crate) struct Heap {
     host: std::sync::OnceLock<Option<host::HostHeap>>,
     #[cfg(windows)]
     pending: std::sync::Mutex<Vec<u32>>,
+    /// The title also copies descriptors (our records) into a shader-visible
+    /// heap itself, as bytes (`sync_heaps`): the last write-watch asking
+    /// looked at, the frame of the last whole look (memory that is not
+    /// watched), and each slot's record as last mirrored (`u64::MAX`: not
+    /// looked at yet).
+    #[cfg(windows)]
+    synced: std::sync::Mutex<(u64, u64, Vec<u64>)>,
 }
 
 pub(crate) fn heap<'a>(this: This) -> &'a Heap {
@@ -143,6 +150,13 @@ fn mirror(handle: u64) {
     let Some((heap, index)) = shader_slot(handle) else {
         return;
     };
+    // Made by a call: not a copy `sync_heaps` has to find.
+    {
+        let mut synced = heap.synced.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(key) = synced.2.get_mut(index as usize) {
+            *key = record_key(handle);
+        }
+    }
     let mut pending = heap.pending.lock().unwrap_or_else(|e| e.into_inner());
     match heap.host.get() {
         None => pending.push(index),
@@ -153,6 +167,123 @@ fn mirror(handle: u64) {
             }
         }
     }
+}
+
+/// The record at `handle` as one word: its entry and generation, 0 if it is
+/// no view of ours.
+#[cfg(windows)]
+fn record_key(handle: u64) -> u64 {
+    // SAFETY: the handle is a descriptor slot in title memory.
+    let [tag, i, generation] = unsafe { (handle as *const [u32; 3]).read_unaligned() };
+    record_key_of(tag, i, generation)
+}
+
+#[cfg(windows)]
+fn record_key_of(tag: u32, i: u32, generation: u32) -> u64 {
+    if tag == VIEW_TAG {
+        u64::from(generation) << 32 | u64::from(i)
+    } else {
+        0
+    }
+}
+
+/// Lot 6 (`VICTORY_L6_HEAP_SYNC`): mirrors what the title wrote into its
+/// shader-visible heaps without a call. Grand Theft Auto VI copies
+/// descriptors (our records) into its heap as plain bytes (upstream
+/// 86a5ed6b: 1,300-14,400 slots a frame in the world); only a change of its
+/// memory shows them, and the host slot meanwhile shows what it showed
+/// before, null or another view: a mesh whose buffers a shader picks by
+/// index reads nothing or another mesh's bytes, and its stride in the
+/// table (which picks how scalar loads read it) is stale too. The slots of
+/// the pages written since the last sync whose record changed are mirrored
+/// as a call would have: at each submission, before its lists run. Memory
+/// that is not write-watched (a heap of ours) is looked at whole, once a
+/// frame.
+#[cfg(windows)]
+pub(crate) fn sync_heaps() {
+    if !crate::l6::heap_sync() {
+        return;
+    }
+    let started = std::time::Instant::now();
+    let (mut slots, mut pages) = (0u64, 0u64);
+    // Held throughout: a heap is not dropped while its slots are made.
+    let heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
+    let mut bytes = vec![0u8; crate::watch::PAGE];
+    for &(start, end, at) in heaps.iter() {
+        // SAFETY: registered heaps are live (removed when dropped).
+        let heap = unsafe { &*(at as *const Heap) };
+        let (Some(Some(host)), Some(step)) = (heap.host.get(), increment(heap.desc.kind)) else {
+            continue;
+        };
+        let step = u64::from(step);
+        let mut synced = heap.synced.lock().unwrap_or_else(|e| e.into_inner());
+        let (last, whole, keys) = &mut *synced;
+        if keys.is_empty() {
+            keys.resize(heap.desc.count as usize, u64::MAX);
+        }
+        let page = crate::watch::PAGE as u64;
+        let ranges: Vec<(u64, u64)> = match crate::watch::writes(start as usize, end as usize, true) {
+            Some((now, written)) => {
+                let ranges = written
+                    .iter()
+                    .filter(|&&(_, asking)| asking > *last)
+                    .map(|&(p, _)| (p as u64 * page, (p as u64 + 1) * page))
+                    .collect();
+                *last = now;
+                ranges
+            }
+            None => {
+                let frame = crate::frame::current();
+                if *whole == frame {
+                    continue;
+                }
+                *whole = frame;
+                (start / page * page..end).step_by(page as usize).map(|p| (p, p + page)).collect()
+            }
+        };
+        for (from, to) in ranges {
+            let (from, to) = (from.max(start), to.min(end));
+            if from >= to {
+                continue;
+            }
+            // Read through the kernel: the title unmaps heap pages too.
+            let chunk = &mut bytes[..(to - from) as usize];
+            if !crate::host::read_into(from as *const u8, chunk) {
+                continue;
+            }
+            pages += 1;
+            // The slots whose record (12 bytes) lies in this range.
+            const RECORD: u64 = 12;
+            let first = (from - start).div_ceil(step);
+            let past = match (to - start).checked_sub(RECORD) {
+                Some(last) => (last / step + 1).min(u64::from(heap.desc.count)),
+                None => continue,
+            };
+            for index in first..past {
+                let handle = start + index * step;
+                let at = (handle - from) as usize;
+                let word = |k: usize| u32::from_le_bytes(chunk[at + 4 * k..at + 4 * k + 4].try_into().unwrap_or_default());
+                let key = record_key_of(word(0), word(1), word(2));
+                let seen = &mut keys[index as usize];
+                if *seen == key {
+                    continue;
+                }
+                // Not looked at before: only a view is news (the rest is
+                // what the heap was made with).
+                if *seen == u64::MAX && key == 0 {
+                    *seen = 0;
+                    continue;
+                }
+                *seen = key;
+                slots += 1;
+                host.mirror(index as u32, handle, false);
+            }
+        }
+    }
+    drop(heaps);
+    crate::l6::add(crate::l6::SYNCED_SLOTS, slots);
+    crate::l6::add(crate::l6::SYNCED_PAGES, pages);
+    crate::l6::add(crate::l6::SYNC_US, started.elapsed().as_micros() as u64);
 }
 
 /// Gives back dynamic slots of the host heap behind the title heap at
@@ -946,6 +1077,8 @@ pub(crate) extern "system" fn create_heap(
         host: std::sync::OnceLock::new(),
         #[cfg(windows)]
         pending: Default::default(),
+        #[cfg(windows)]
+        synced: std::sync::Mutex::new((0, u64::MAX, Vec::new())),
     });
     #[cfg(windows)]
     if visible {
@@ -1027,6 +1160,50 @@ mod tests {
         assert_eq!(increment_size(null, 9), 0);
         let bad = HeapDesc { kind: 9, ..desc };
         assert_eq!(create(bad, none, &mut h), E_INVALIDARG);
+    }
+
+    /// Lot 6: a record the title copies into its shader-visible heap as
+    /// bytes (no call) is made on the host at the next sync, and only then.
+    #[cfg(windows)]
+    #[test]
+    fn records_copied_as_bytes_are_made_at_the_next_sync() {
+        use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree};
+        const MEM_WRITE_WATCH: u32 = 0x20_0000;
+        // A write-watched page, as the title's heap memory is.
+        // SAFETY: a fresh allocation, freed below.
+        let memory = unsafe {
+            VirtualAlloc(std::ptr::null(), 64 << 10, MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH, PAGE_READWRITE)
+        } as u64;
+        assert_ne!(memory, 0);
+        let desc = HeapDesc {
+            kind: SAMPLERS,
+            count: 64,
+            flags: SHADER_VISIBLE,
+            nodes: 1,
+        };
+        let mut h = std::ptr::null();
+        let placement = Placement {
+            address: memory,
+            size: 64 * 16,
+        };
+        assert_eq!(create(desc, placement, &mut h), S_OK);
+        if let Some(host) = heap(h).host() {
+            // A first sync looks at what is there.
+            sync_heaps();
+            // Our record, written where no heap sees it, then copied in.
+            let mut elsewhere = [0u64; 2];
+            let at = elsewhere.as_mut_ptr() as u64;
+            create_sampler(std::ptr::null(), &[21, 3, 3, 3, 0, 1, 0, 0, 0, 0, 0, 0x7f7f_ffff, 0], at);
+            let slot = memory + 5 * 16;
+            // SAFETY: 16 bytes of each, ours.
+            unsafe { std::ptr::copy_nonoverlapping(at as *const u8, slot as *mut u8, 16) };
+            assert!(!host.made(5));
+            sync_heaps();
+            assert_eq!(host.made(5), crate::l6::heap_sync(), "made at the sync");
+        }
+        slot::<extern "system" fn(This) -> u32>(h, 0x10)(h);
+        // SAFETY: our allocation.
+        unsafe { VirtualFree(memory as *mut _, 0, MEM_RELEASE) };
     }
 
     #[test]
