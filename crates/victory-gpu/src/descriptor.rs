@@ -286,6 +286,31 @@ pub(crate) fn sync_heaps() {
     crate::l6::add(crate::l6::SYNC_US, started.elapsed().as_micros() as u64);
 }
 
+/// Lot 6 (`VICTORY_L6_SUBMIT_SLOTS`): the buffer views written into the
+/// shader-visible view heaps since the last submission get their host
+/// slots, their bytes refreshed with `list`'s submission
+/// ([`host::HostHeap::submit_fresh`]).
+#[cfg(windows)]
+pub(crate) fn submit_slots(list: &crate::host::HostList) {
+    if !crate::l6::submit_slots() {
+        return;
+    }
+    let heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
+    let mut made = 0;
+    for &(_, _, at) in heaps.iter() {
+        // SAFETY: registered heaps are live (removed when dropped).
+        let heap = unsafe { &*(at as *const Heap) };
+        if heap.samplers() {
+            continue;
+        }
+        if let Some(Some(host)) = heap.host.get() {
+            made += host.submit_fresh(heap, list);
+        }
+    }
+    drop(heaps);
+    crate::l6::add(crate::l6::SUBMIT_MADE, made);
+}
+
 /// Gives back dynamic slots of the host heap behind the title heap at
 /// `heap`, if that heap still exists.
 #[cfg(windows)]

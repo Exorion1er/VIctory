@@ -62,6 +62,9 @@ pub(crate) struct HostHeap {
     /// Of those and of the slots that left the set: the ones written since
     /// [`HostHeap::buffer_changes`] last took them.
     changed: Mutex<std::collections::HashSet<u32>>,
+    /// Lot 6 (`VICTORY_L6_SUBMIT_SLOTS`): the title slots written with a
+    /// buffer view since the last submission ([`HostHeap::submit_fresh`]).
+    fresh: Mutex<std::collections::BTreeSet<u32>>,
     /// Title slots holding a view of a texture the title may fill itself (a
     /// placed texture, a texture object), with the frame from which they
     /// are due: such a texture is uploaded when a draw reads it through a
@@ -634,6 +637,7 @@ impl HostHeap {
             strides,
             buffers: Mutex::default(),
             changed: Mutex::default(),
+            fresh: Mutex::default(),
             textures: Mutex::default(),
             tabled: (0..if sampler { 0 } else { count })
                 .map(|_| std::sync::atomic::AtomicU32::new(0))
@@ -971,6 +975,37 @@ impl HostHeap {
         std::mem::take(&mut *changed).into_iter().collect()
     }
 
+    /// Lot 6 (`VICTORY_L6_SUBMIT_SLOTS`): makes the host slots of the buffer
+    /// views written since the last call and brings their bytes up to date
+    /// when `list` is submitted. Such a write leaves the host slot null
+    /// ([`HostHeap::mirror`], a buffer view waits for a draw), and for
+    /// shaders that pick buffers from the heap by an index only the pass
+    /// over the heap made it: once a frame, at the first such draw
+    /// recorded. A view written after that pass (a ring of per-frame
+    /// views, a mesh streamed in, ped skinning's vertex buffers) read
+    /// nothing for the rest of the frame: zeros where a mesh's vertices or
+    /// its header were, a mesh collapsed or culled, on whichever frames the
+    /// threads ran in that order. Called before each submission's lists
+    /// run; the slots stay in [`HostHeap::buffer_changes`] for the pass.
+    /// Returns how many it made.
+    pub(crate) fn submit_fresh(&self, heap: &crate::descriptor::Heap, list: &crate::host::HostList) -> u64 {
+        let fresh = std::mem::take(&mut *self.fresh.lock().unwrap_or_else(|e| e.into_inner()));
+        let mut made = 0;
+        for index in fresh {
+            let Some(handle) = heap.handle(index) else {
+                continue;
+            };
+            let Some(view) = self.mirror(index, handle, true) else {
+                continue;
+            };
+            made += 1;
+            if let Some((shadow, address, len)) = buffer_copy(&view) {
+                shadow.refresh(list, address, len);
+            }
+        }
+        made
+    }
+
     /// Records what title slot `index` now holds for shaders that pick
     /// buffers from the heap: its element stride in the table, and whether
     /// it is a buffer view at all.
@@ -1055,6 +1090,9 @@ impl HostHeap {
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .insert(index);
+        }
+        if stride.is_some() && !seen && crate::l6::submit_slots() {
+            self.fresh.lock().unwrap_or_else(|e| e.into_inner()).insert(index);
         }
         stale
     }
