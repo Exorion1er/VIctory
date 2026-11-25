@@ -89,6 +89,8 @@ fn build() -> &'static [u8; 32] {
             // the wave switches of the 64-lane pixel forms
             "VICTORY_HOST_WAVE",
             "VICTORY_PS_HALVES",
+            // the view heap clamp on uncapped hosts (`descriptor::host::heap_clamp`)
+            "VICTORY_L6_HEAP_CLAMP",
         ] {
             match std::env::var_os(name) {
                 None => key.update(&[0]),

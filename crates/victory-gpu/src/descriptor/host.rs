@@ -512,6 +512,26 @@ pub(crate) fn near_heaps(va: u64) -> String {
 /// tiers 1 and 2; tier 3 hardware may take more.
 const PORTABLE_VIEWS: u32 = 1_000_000;
 
+/// The size of every host view heap on a host that takes one this large
+/// (AMD; vkd3d-proton with `VKD3D_CONFIG=descriptor_heap`), with
+/// [`heap_clamp`]: the title's heap (1,245,184 views in the retail game)
+/// plus [`DYNAMIC`] fits, and the last slot is the null slot every view
+/// index at or past it reads. Upstream sizes its heaps the same way
+/// (`HEAP_VIEWS`).
+const UNCAPPED_VIEWS: u32 = 1 << 21;
+
+/// `VICTORY_L6_HEAP_CLAMP` (on unless `0`; fork PRs #134 and #98, upstream
+/// `HEAP_VIEWS`): view indices are clamped on hosts that do not cap view
+/// heaps too. Without it an index past the heap's end reads past it: AMD
+/// RDNA3/RDNA4 on Windows took page faults there (slot 16,777,088 of a
+/// heap of 1,507,328, in the meshlet culling computes), and under
+/// vkd3d-proton it reads whatever descriptor memory follows. Off: only a
+/// capped host (NVIDIA) clamps, as before.
+pub(crate) fn heap_clamp() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_L6_HEAP_CLAMP").is_none_or(|v| v != "0"))
+}
+
 /// Asks the host, once, whether it caps view heaps at [`PORTABLE_VIEWS`],
 /// and if so tells the translator now (`set_view_heap_limit`) instead of
 /// when the title's heap is made: a shader keeps the limit it was
@@ -526,6 +546,24 @@ pub(crate) fn probe_view_limit() {
     static ONCE: std::sync::Once = std::sync::Once::new();
     ONCE.call_once(|| {
         let Some(host) = host() else { return };
+        let clamp = heap_clamp();
+        tracing::info!(on = clamp, "VICTORY_L6_HEAP_CLAMP: view heaps of {UNCAPPED_VIEWS} on hosts that take them, view indices clamped to their last (null) slot");
+        if clamp {
+            // SAFETY: plain heap creation; the heap is released at once.
+            let fits: windows::core::Result<ID3D12DescriptorHeap> = unsafe {
+                host.device.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+                    Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+                    NumDescriptors: UNCAPPED_VIEWS,
+                    Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
+                    NodeMask: 0,
+                })
+            };
+            if fits.is_ok() {
+                tracing::info!("the host takes view heaps of {UNCAPPED_VIEWS}: view indices are clamped to the null slot at their end from the first shader on");
+                victory_shader::emit::set_view_heap_limit(UNCAPPED_VIEWS - 1);
+                return;
+            }
+        }
         // SAFETY: plain heap creation; the heap is released at once.
         let made: windows::core::Result<ID3D12DescriptorHeap> = unsafe {
             host.device
@@ -577,8 +615,23 @@ impl HostHeap {
             }
         };
         let extra = if sampler { 0 } else { DYNAMIC };
-        let (heap, count, size) = match make(count + extra) {
-            Ok(heap) => (heap, count, count + extra),
+        // With `VICTORY_L6_HEAP_CLAMP`, a view heap ends at the null slot
+        // shaders clamp view indices to: the title's slots, the dynamic
+        // ones, then null up to and with that slot.
+        if !sampler {
+            probe_view_limit();
+        }
+        let uncapped = !sampler && victory_shader::emit::view_heap_limit() == UNCAPPED_VIEWS - 1;
+        if uncapped && count + extra >= UNCAPPED_VIEWS {
+            tracing::warn!(count, "a title view heap past {UNCAPPED_VIEWS}: indices past the clamp read a title slot");
+        }
+        let wanted = if uncapped && count + extra < UNCAPPED_VIEWS {
+            UNCAPPED_VIEWS
+        } else {
+            count + extra
+        };
+        let (heap, count, size) = match make(wanted) {
+            Ok(heap) => (heap, count, wanted),
             Err(e) if !sampler && count + extra > PORTABLE_VIEWS => {
                 // shortcut: descriptors past the host's limit are left out; a title that reaches
                 // them needs remapping. The heap's last slot stays null, and shaders read it for
@@ -605,7 +658,7 @@ impl HostHeap {
         let gpu = unsafe { heap.GetGPUDescriptorHandleForHeapStart().ptr };
         GPU_RANGES.lock().unwrap_or_else(|e| e.into_inner()).push((
             gpu,
-            u64::from(count + extra) * u64::from(step),
+            u64::from(size) * u64::from(step),
             u64::from(step),
             sampler,
         ));
