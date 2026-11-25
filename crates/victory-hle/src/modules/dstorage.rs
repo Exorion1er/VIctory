@@ -42,6 +42,8 @@ const E_NOINTERFACE: HRESULT = 0x8000_4002_u32 as i32;
 const E_OUTOFMEMORY: HRESULT = 0x8007_000E_u32 as i32;
 /// `HRESULT_FROM_WIN32(ERROR_HANDLE_EOF)`: the source ends early.
 const END_OF_FILE: HRESULT = 0x8007_0026_u32 as i32;
+/// `ERROR_NOACCESS`: the kernel could not write a page (read-only).
+const ERROR_NOACCESS: i32 = 998;
 /// `HRESULT_FROM_WIN32(ERROR_INVALID_DATA)`: a bad compressed stream.
 const INVALID_DATA: HRESULT = 0x8007_000D_u32 as i32;
 
@@ -924,6 +926,7 @@ fn read_into(request: &Request, out: &mut [u8]) -> Result<(), HRESULT> {
         .file;
     let started = std::time::Instant::now();
     let mut done = 0;
+    let mut retried = false;
     let result = loop {
         if done == out.len() {
             break Ok(());
@@ -931,6 +934,26 @@ fn read_into(request: &Request, out: &mut [u8]) -> Result<(), HRESULT> {
         match file.seek_read(&mut out[done..], request.offset + done as u64) {
             Ok(0) => break Err(END_OF_FILE),
             Ok(n) => done += n,
+            // AnyXboxX lot 9 (`VICTORY_L9_DSTORAGE_GUARDS`): the kernel met a
+            // page left read-only (a guard armed again; `into_destination`
+            // holds them open, this is the second line): the rest opened
+            // and read once more.
+            Err(error)
+                if error.raw_os_error() == Some(ERROR_NOACCESS)
+                    && !retried
+                    && victory_gpu::kernel_writes_held() =>
+            {
+                retried = true;
+                let at = out[done..].as_ptr() as usize;
+                let len = out.len() - done;
+                tracing::warn!(
+                    offset = request.offset + done as u64,
+                    at = format_args!("{at:#x}"),
+                    len,
+                    "dstorage: a read into title memory met a read-only page (ERROR_NOACCESS); its guards opened, read again (VICTORY_L9_DSTORAGE_GUARDS)"
+                );
+                victory_gpu::kernel_will_write(at, len);
+            }
             Err(error) => break Err(from_win32(&error)),
         }
     };
@@ -950,8 +973,13 @@ fn into_destination(
 ) -> Result<(), HRESULT> {
     if request.options & PAGE_DESTINATION == 0 {
         // Raw reads land through the kernel, which does not fault into the
-        // GPU side's guard on title buffers; open them first.
-        victory_gpu::kernel_will_write(request.destination as usize, len);
+        // GPU side's guard on title buffers; open them first, and (AnyXboxX
+        // lot 9, `VICTORY_L9_DSTORAGE_GUARDS`) keep them open until the
+        // bytes are in: a check on another thread armed them again while a
+        // read ran, and the read failed (ERROR_NOACCESS). Every kind of
+        // request with an address destination (file or memory source,
+        // copied, inflated or unpacked) goes through here.
+        let _held = victory_gpu::kernel_write(request.destination as usize, len);
         // SAFETY: the title's destination holds `destination_size` bytes, at
         // least `len`, and nothing else writes it until completion.
         let out = unsafe { std::slice::from_raw_parts_mut(request.destination.cast::<u8>(), len) };

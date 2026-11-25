@@ -503,6 +503,10 @@ struct Guards {
     /// The frame and the blocks that faulted in it, with how many times
     /// (counted, `crate::l8ww`; `crate::l8ww::rearm_frame`).
     faulted: (u64, BTreeMap<usize, u32>),
+    /// AnyXboxX lot 9 (`VICTORY_L9_DSTORAGE_GUARDS`): blocks a write of the
+    /// runtime's through the kernel is under way in ([`kernel_write`]), with
+    /// how many such writes hold each. No check arms them meanwhile.
+    held: BTreeMap<usize, u32>,
 }
 
 static GUARDS: Mutex<Guards> = Mutex::new(Guards {
@@ -510,6 +514,7 @@ static GUARDS: Mutex<Guards> = Mutex::new(Guards {
     clean: BTreeSet::new(),
     absent: BTreeSet::new(),
     faulted: (0, BTreeMap::new()),
+    held: BTreeMap::new(),
 });
 
 /// With `crate::l8ww::rearm_frame`: whether written `block` stays open
@@ -609,6 +614,11 @@ fn guard_timed(start: usize, end: usize) -> Option<Vec<usize>> {
             if g.protected.contains(&block) {
                 // Written through the runtime, still read-only.
                 g.clean.insert(block);
+            } else if g.held.contains_key(&block) {
+                // Lot 9: a kernel write lands here now; armed, it would fail
+                // (ERROR_NOACCESS). Left open and not clean: the next check
+                // takes it again, after the write.
+                crate::l8ww::add(crate::l8ww::Count::HeldOpen, 1);
             } else if !rearm_deferred(&mut g, block) {
                 run.get_or_insert(block);
                 continue;
@@ -747,6 +757,19 @@ fn cut_at_views(from: usize, to: usize, runs: &mut Vec<(usize, usize)>) {
 
 /// [`protect`] for one range, without the other views of its pages.
 fn protect_here(g: &mut Guards, from: usize, to: usize) {
+    // AnyXboxX lot 9 (`VICTORY_L9_DSTORAGE_GUARDS`): blocks a kernel write
+    // is landing in stay open, whichever view's check arms this range (the
+    // same pages at another view are armed with it, fork #115).
+    if let Some(&held) = g.held.range(from..to).next().map(|(b, _)| b) {
+        crate::l8ww::add(crate::l8ww::Count::HeldOpen, 1);
+        if from < held {
+            protect_here(g, from, held);
+        }
+        if held + 1 < to {
+            protect_here(g, held + 1, to);
+        }
+        return;
+    }
     if crate::l8ww::protect_runs() {
         let mut runs = Vec::new();
         cut_at_views(from, to, &mut runs);
@@ -927,6 +950,81 @@ pub fn title_memory_written(section: usize, offset: u64, len: usize) {
     for (at, n) in ranges {
         // A placed texture there changes with no descriptor written.
         crate::descriptor::host::remapped(at, n);
+    }
+}
+
+/// AnyXboxX lot 9: `VICTORY_L9_DSTORAGE_GUARDS` (on unless `0`). A write of
+/// the runtime's into title memory through the kernel (DirectStorage's file
+/// reads into an address, `NtReadFile`) does not fault into our handler
+/// when it meets a guard: it fails, `ERROR_NOACCESS`. [`writing`] opened
+/// the guards before it, but let go of them at once, and a check on another
+/// thread (`guard`, at a submission) armed blocks of the destination again
+/// while the read ran: the request failed and the title stopped on its
+/// `int3` (AnyXboxX lot 8 run 20, an uncompressed 54,240-byte request; three
+/// times without the stop in run 11). With the switch, [`kernel_write`]
+/// holds the blocks open until the write is done.
+pub fn kernel_writes_held() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var_os("VICTORY_L9_DSTORAGE_GUARDS").is_none_or(|v| v != "0");
+        tracing::info!(on, "VICTORY_L9_DSTORAGE_GUARDS: guards held open over the runtime's kernel writes into title memory");
+        on
+    })
+}
+
+/// A write of the runtime's into title memory under way ([`kernel_write`]).
+pub struct KernelWrite {
+    at: usize,
+    len: usize,
+    /// The blocks held (lot 9), empty without the switch.
+    blocks: std::ops::Range<usize>,
+}
+
+/// Before the runtime writes title memory `[at, at + len)` through the
+/// kernel, or writes it in place while it may also go through the kernel
+/// (DirectStorage, every request kind with an address destination): opens
+/// its guarded blocks ([`writing`]) and, with [`kernel_writes_held`], holds
+/// them open until what it returns is dropped, after the write. Dropped, it
+/// notes the bytes written once more, now that they are in: a check that
+/// copied the blocks while the write ran copies them again.
+pub fn kernel_write(at: usize, len: usize) -> KernelWrite {
+    let end = at.saturating_add(len);
+    let blocks = if kernel_writes_held() && len > 0 {
+        at / BLOCK..end.div_ceil(BLOCK)
+    } else {
+        0..0
+    };
+    {
+        let mut g = guards_waited();
+        for block in blocks.clone() {
+            *g.held.entry(block).or_insert(0) += 1;
+        }
+        open(&mut g, at, end);
+    }
+    crate::descriptor::host::remapped(at, len);
+    KernelWrite { at, len, blocks }
+}
+
+impl Drop for KernelWrite {
+    fn drop(&mut self) {
+        if self.blocks.is_empty() {
+            return;
+        }
+        {
+            let mut g = guards_waited();
+            for block in self.blocks.clone() {
+                if let Some(n) = g.held.get_mut(&block) {
+                    *n -= 1;
+                    if *n == 0 {
+                        g.held.remove(&block);
+                    }
+                }
+                // Taken by a check while the write ran: not clean any more.
+                g.clean.remove(&block);
+            }
+            open(&mut g, self.at, self.at.saturating_add(self.len));
+        }
+        crate::descriptor::host::remapped(self.at, self.len);
     }
 }
 
@@ -1117,6 +1215,71 @@ mod tests {
         );
         // SAFETY: our allocation.
         unsafe { VirtualFree(p as *mut _, 0, MEM_RELEASE) };
+    }
+
+    /// AnyXboxX lot 9 (`VICTORY_L9_DSTORAGE_GUARDS`): a check that runs
+    /// between opening a destination and the kernel's write into it (another
+    /// thread's submission) arms the block again and the read fails, as
+    /// DirectStorage's did (lot 8 run 20); held by [`kernel_write`], the
+    /// block stays open through the check, the read lands, and the next
+    /// check after the hold reports the block written.
+    #[test]
+    fn a_check_during_a_held_kernel_write_leaves_its_blocks_open() {
+        use std::io::{Read, Seek, Write};
+        use windows_sys::Win32::System::Memory::{
+            CreateFileMappingW, FILE_MAP_WRITE, MapViewOfFile, UnmapViewOfFile,
+        };
+        // SAFETY: a pagefile section of two blocks, mapped read-write.
+        let view = unsafe {
+            let section = CreateFileMappingW(
+                -1isize as _,
+                std::ptr::null(),
+                PAGE_READWRITE,
+                0,
+                (2 * BLOCK) as u32,
+                std::ptr::null(),
+            );
+            assert!(!section.is_null());
+            MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, 2 * BLOCK).Value as usize
+        };
+        assert_ne!(view, 0);
+        assert!(guard(view, view + 2 * BLOCK).is_some()); // now read-only
+        let mut file = tempfile::tempfile().unwrap();
+        file.write_all(b"from the disk").unwrap();
+        let read = |file: &mut std::fs::File| {
+            file.rewind().unwrap();
+            // SAFETY: 13 bytes of our view, nothing else refers to them.
+            let into = unsafe { std::slice::from_raw_parts_mut((view + 100) as *mut u8, 13) };
+            file.read(into).is_ok_and(|n| n == 13)
+        };
+        // Opened only, as before: the check in between arms it again.
+        writing(view + 100, 13);
+        let _ = guard(view, view + 2 * BLOCK);
+        assert!(!read(&mut file), "armed again by the check, the kernel's write fails");
+        if kernel_writes_held() {
+            let held = kernel_write(view + 100, 13);
+            let _ = guard(view, view + 2 * BLOCK);
+            assert!(read(&mut file), "held open through the check");
+            drop(held);
+            // SAFETY: the bytes just read.
+            let landed = unsafe { std::slice::from_raw_parts((view + 100) as *const u8, 13) };
+            assert_eq!(landed, b"from the disk");
+            assert_eq!(
+                guard(view, view + 2 * BLOCK),
+                Some((view / PAGE..view / PAGE + 1).collect()),
+                "written, after the hold"
+            );
+            assert!(guards().held.is_empty());
+        }
+        // SAFETY: our view.
+        unsafe {
+            UnmapViewOfFile(
+                windows_sys::Win32::System::Memory::MEMORY_MAPPED_VIEW_ADDRESS {
+                    Value: view as *mut _,
+                },
+            )
+        };
+        title_memory_remapped(view, 2 * BLOCK);
     }
 
     /// A kernel read into a guarded view block fails; opened first, it
@@ -1687,6 +1850,34 @@ mod tests {
         assert_eq!(guard(guarded, guarded + SIZE), Some(vec![pages(1)]));
         assert_eq!(guard(guarded, guarded + SIZE), Some(Vec::new()));
         drop_views(section, &[guarded, other], SIZE);
+    }
+
+    /// AnyXboxX lot 9 (`VICTORY_L9_DSTORAGE_GUARDS`): a kernel write held
+    /// at one view stays possible while a check of another view of the same
+    /// pages arms them (fork #115 arms every view of a page).
+    #[test]
+    fn a_held_kernel_write_survives_a_check_at_another_view() {
+        use std::io::{Read, Seek, Write};
+        const SIZE: usize = 2 * BLOCK;
+        let (section, target, other) = two_views(SIZE);
+        let mut file = tempfile::tempfile().unwrap();
+        file.write_all(b"from the disk").unwrap();
+        let read = |file: &mut std::fs::File| {
+            file.rewind().unwrap();
+            // SAFETY: 13 bytes of the first view, nothing else refers to them.
+            let into = unsafe { std::slice::from_raw_parts_mut((target + 100) as *mut u8, 13) };
+            file.read(into).is_ok_and(|n| n == 13)
+        };
+        let _ = guard(other, other + SIZE); // arms both views
+        assert!(!read(&mut file), "armed through the other view");
+        if kernel_writes_held() {
+            let held = kernel_write(target + 100, 13);
+            let _ = guard(other, other + SIZE);
+            assert!(read(&mut file), "held open through the other view's check");
+            drop(held);
+            assert!(guards().held.is_empty());
+        }
+        drop_views(section, &[target, other], SIZE);
     }
 
     /// A view of guarded pages is mapped anew: it is writable, so the

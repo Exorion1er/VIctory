@@ -187,9 +187,12 @@ pub(crate) enum Count {
     QueriesSkipped,
     /// Guards left open until the next frame ([`rearm_frame`]).
     RearmDeferred,
+    /// AnyXboxX lot 9: blocks a check left open because a kernel write of
+    /// the runtime's was under way there (`crate::watch::kernel_write`).
+    HeldOpen,
 }
 
-const COUNTS: usize = 6;
+const COUNTS: usize = 7;
 
 static COUNT: [AtomicU64; COUNTS] = [const { AtomicU64::new(0) }; COUNTS];
 
@@ -253,12 +256,13 @@ pub(crate) fn line(frames: f64) -> String {
          blocks known unmapped, WW_ABSENT_TRUST); QueryWorkingSetEx \
          {set:.0} {set_ms:.2} ms; ReadProcessMemory {read:.0} {read_ms:.2} ms; guard faults {fault:.0} \
          ({:.0} on a block that faulted earlier in the frame) {fault_ms:.2} ms in the handler, {:.0} guards \
-         left open to the next frame (GUARD_REARM_FRAME); waits for our \
+         left open to the next frame (GUARD_REARM_FRAME), {:.1} left open under a kernel write (L9_DSTORAGE_GUARDS); waits for our \
          locks: guards {:.2} ms, write-watch journal {:.2} ms",
         c[Count::WatchesSkipped as usize],
         c[Count::QueriesSkipped as usize],
         c[Count::FaultsAgain as usize],
         c[Count::RearmDeferred as usize],
+        c[Count::HeldOpen as usize],
         c[Count::GuardsWaitUs as usize] / 1e3,
         c[Count::JournalWaitUs as usize] / 1e3,
     )
