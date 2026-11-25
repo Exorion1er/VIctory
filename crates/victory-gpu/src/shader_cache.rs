@@ -70,6 +70,10 @@ fn build() -> &'static [u8; 32] {
         let mut key = blake3::Hasher::new();
         key.update(victory_shader::SOURCE_HASH.as_bytes());
         let limit = victory_shader::emit::loop_limit();
+        tracing::info!(
+            on = std::env::var_os("VICTORY_L6_NAN_GUARD").is_none_or(|v| v != "0"),
+            "VICTORY_L6_NAN_GUARD: NaN made 0 and infinities 65504 in colour exports and typed stores"
+        );
         if limit != victory_shader::emit::DEFAULT_LOOP_LIMIT {
             tracing::warn!(
                 limit,
@@ -91,6 +95,8 @@ fn build() -> &'static [u8; 32] {
             "VICTORY_PS_HALVES",
             // the view heap clamp on uncapped hosts (`descriptor::host::heap_clamp`)
             "VICTORY_L6_HEAP_CLAMP",
+            // NaN and infinities out of colour exports and typed stores
+            "VICTORY_L6_NAN_GUARD",
         ] {
             match std::env::var_os(name) {
                 None => key.update(&[0]),
