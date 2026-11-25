@@ -994,7 +994,8 @@ pub(super) fn with_local_waves<R>(f: impl FnOnce() -> R) -> R {
 /// ([`Lower::f16_nearest`]) instead of as the host's `f32tof16` does (toward zero on NVIDIA:
 /// the last place of a result that is not exact is then one lower than the console's).
 /// Off by default: it is exact but untried in a game run, and adds instructions to every
-/// such operation. The wave sum of 16-bit floats ([`Lower::half_sum`]) is always exact.
+/// such operation. The wave sum of 16-bit floats ([`Lower::half_sum`]) is exact where
+/// every lane runs (rounded once otherwise, on one host wave of 64).
 fn f16_nearest_on() -> bool {
     #[cfg(test)]
     if let Some(on) = TEST_F16_NEAREST.get() {
@@ -2066,14 +2067,36 @@ impl<'a> Lower<'a> {
         } else {
             all_lane_blocks(self.x.st).is_some_and(|all| all.get(self.cur_ir).copied().unwrap_or(false))
         };
-        if !every {
-            if halves {
-                need(self.cur_ir);
-            }
+        if !every && halves {
+            need(self.cur_ir);
             return Err(WHERE);
         }
         let c = self.cur;
         let i32t = self.s.t.i32;
+        if !every {
+            // One host wave of 64 where not every lane runs: the lanes that do not
+            // run cannot be read for the tree, so the host's sum over the running
+            // lanes (the others hold +0 here, as on the console) is taken in f32
+            // and rounded once to 16 bits. The high half is the first running
+            // lane's, lane 0 may not run.
+            // shortcut: not bit for bit (the console rounds each addition to 16
+            // bits, in its tree order); an error of an f16 ulp or so per sum.
+            let low = self.s.m.i32(0xFFFF);
+            let h = self.s.m.bin(c, Bin::And, x, low);
+            let f32t = self.s.t.f32;
+            let f = self.s.op(c, "legacyF16ToF32", Attr::ReadNone, f32t, 131, &[h]);
+            let (k0, k0u) = (self.s.m.i8(0), self.s.m.i8(0));
+            let sum = self
+                .s
+                .op(c, "waveActiveOp.f32", Attr::NoUnwind, f32t, 119, &[f, k0, k0u]);
+            let sum = self.f16_nearest(sum);
+            let c = self.cur;
+            let sum = self.s.m.bin(c, Bin::And, sum, low);
+            let first = self.s.op(c, "waveReadLaneFirst.i32", Attr::NoUnwind, i32t, 118, &[x]);
+            let high = self.s.m.i32(0xFFFF_0000);
+            let first = self.s.m.bin(c, Bin::And, first, high);
+            return Ok(self.s.m.bin(c, Bin::Or, first, sum));
+        }
         let lane = self.s.op(c, "waveGetLaneIndex", Attr::ReadOnly, i32t, 111, &[]);
         let mut sum = x;
         for step in 0..if halves { 5 } else { 6 } {
@@ -11587,5 +11610,88 @@ mod tests {
         assert!(f10(0x3FF).is_nan());
         // A 16-bit float is a half already, sign included.
         assert_eq!(half(0xBC00 << half_shift(16)), -1.0);
+    }
+
+    #[test]
+    fn a_wave_sum_of_halves_where_not_every_lane_runs_lowers_on_64_lane_waves() {
+        // A wave64 program of 64 threads: lanes below s0 enter a branch whose
+        // body is the console's f16 wave sum of v7 into s7, then store it.
+        let mut body = vec![
+            0xBE85_0380, // s_mov_b32 s5, 0
+            0xF408_0202,
+            0xFA00_0000, // s_load_dwordx4 s[8:11], s[4:5], 0
+            0x7E0A_0281, // v_mov_b32 v5, 1
+            0x2C0C_0081, // v_lshrrev_b32 v6, 1, v0
+            0x340E_0B06, // v_lshlrev_b32 v7, v6, v5
+            0x7D88_0000, // v_cmp_gt_u32 vcc, s0, v0
+            0xBE8C_246A, // s_and_saveexec_b64 s[12:13], vcc
+            0xBF88_0000 | 23, // s_cbranch_execz to the restore of EXEC
+        ];
+        // (the wave OR's words with v_add_f16 for v_or_b32: opcode 50 for 28)
+        body.extend(super::super::wave::WAVE_OR_V7_TO_S7.iter().map(|&w| {
+            if w >> 25 == 28 { w & 0x01FF_FFFF | 50 << 25 } else { w }
+        }));
+        body.extend_from_slice(&[
+            0x7E00_0207, // v_mov_b32 v0, s7
+            0x38 << 26 | 0x1C << 18,
+            0x80 << 24 | 2 << 16, // buffer_store_dword v0, off, s[8:11], 0
+            0xBEFE_040C,          // s_mov_b64 exec, s[12:13]
+            S_ENDPGM,
+        ]);
+        let native = NativeProgram {
+            stage: HwStage::Cs,
+            wave64: true,
+            vgprs: 16,
+            layout: vec![
+                RootParam {
+                    root: RootType::Constants,
+                    table_offset_dwords: 0,
+                    sgprs: 4,
+                    base_register: 0,
+                    user_data: 0,
+                    slot: 0,
+                },
+                RootParam {
+                    root: RootType::Table,
+                    table_offset_dwords: 0,
+                    sgprs: 1,
+                    base_register: 0,
+                    user_data: 4,
+                    slot: 1,
+                },
+            ],
+            used: vec![UsedResource {
+                kind: ResourceType::Uav,
+                root: RootType::Table,
+                table_offset_dwords: 0,
+                lower_bound: 0,
+                stride: 0,
+                dwords: 4,
+                user_data: 4,
+                slot: 1,
+            }],
+            io: StageIo::Cs(ComputeIo { rsrc2: 5 << 1, threads: [64, 1, 1] }),
+            code: body.iter().flat_map(|w| w.to_le_bytes()).collect(),
+        };
+        let p = ir::build(&native.code, true, native.vgprs).unwrap();
+        assert!(p.blocks.iter().flat_map(|b| &b.insts).any(|i| i.name() == "v_add_f16"));
+        let st = structure::structure(&p).unwrap();
+        let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+        let io = io::raise(&p, &native).unwrap();
+        let was = super::TEST_HOST_WAVE.replace(Some(64));
+        let l = lower(&Parts {
+            native: &native,
+            p: &p,
+            st: &st,
+            io: &io,
+            res: &res,
+            inputs: vec![],
+            outputs: vec![],
+            prims: vec![],
+            mesh_stride: 0,
+        });
+        super::TEST_HOST_WAVE.set(was);
+        let l = l.unwrap();
+        assert!(l.wave_ops);
     }
 }
