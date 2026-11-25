@@ -10674,9 +10674,13 @@ impl<'a> Lower<'a> {
             m.max_vertices
                 .min(self.s.threads.map_or(u32::MAX, |t| t[0]))
         });
+        // Each corner is 10 bits: a 9-bit vertex index and, above it, its
+        // edge flag (bits 9, 19 and 29), which only the console's edge-flag
+        // rasterisation reads. Masked to 10 bits, a flagged corner named
+        // vertex 512 + n and the triangle was culled as past the count.
         let mut indices = [z; 3];
         for (k, slot) in indices.iter_mut().enumerate() {
-            let (shift, mask) = (self.s.m.i32(10 * k as u32), self.s.m.i32(0x3FF));
+            let (shift, mask) = (self.s.m.i32(10 * k as u32), self.s.m.i32(0x1FF));
             let i = self.s.m.bin(c, Bin::LShr, x, shift);
             let i = self.s.m.bin(c, Bin::And, i, mask);
             if let Some(n) = written {
