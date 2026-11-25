@@ -84,6 +84,22 @@ pub(crate) fn ask_ahead(ranges: &[(usize, usize)]) {
         return;
     }
     pieces.sort_unstable();
+    // The write-watched reservation of the runtime's each piece lies in
+    // (its start), with `crate::l8ww::by_reservation`.
+    let within: Vec<Option<usize>> = if crate::l8ww::by_reservation() {
+        let r = RESERVED.lock().unwrap_or_else(|e| e.into_inner());
+        pieces
+            .iter()
+            .map(|&(first, last)| {
+                r.range(..=first * PAGE)
+                    .next_back()
+                    .filter(|&(_, &(end, placeholder))| !placeholder && last * PAGE <= end)
+                    .map(|(&start, _)| start)
+            })
+            .collect()
+    } else {
+        vec![None; pieces.len()]
+    };
     let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
     let j = &mut *j;
     // The submission's one asking stands ([`ask_once`]): what it does not
@@ -100,7 +116,7 @@ pub(crate) fn ask_ahead(ranges: &[(usize, usize)]) {
         let mut last = pieces[i].1;
         let mut k = i + 1;
         while k < pieces.len()
-            && pieces[k].0 <= last + AHEAD_GAP
+            && (pieces[k].0 <= last + AHEAD_GAP || (within[i].is_some() && within[k] == within[i]))
             && last.max(pieces[k].1) - first <= AHEAD_MAX
         {
             last = last.max(pieces[k].1);
@@ -1161,6 +1177,40 @@ mod tests {
             windows_sys::Win32::Foundation::CloseHandle(section);
         }
         title_memory_remapped(p, 3 * BLOCK);
+    }
+
+    /// A submission's ranges far apart in one write-watched reservation of
+    /// the runtime's are asked about in one call with
+    /// `VICTORY_L8_WW_BY_RESERVATION` (the pages between them are in the
+    /// journal's answer), in two without; the writes are seen either way.
+    #[test]
+    fn ranges_of_one_watched_reservation_are_asked_together() {
+        const SIZE: usize = 64 << 20;
+        // SAFETY: a fresh write-watched reservation, two pieces committed.
+        let p = unsafe {
+            VirtualAlloc(std::ptr::null(), SIZE, MEM_RESERVE | MEM_WRITE_WATCH, PAGE_READWRITE)
+        } as usize;
+        assert_ne!(p, 0);
+        let (a, b) = (p, p + SIZE - PAGE);
+        for at in [a, b] {
+            // SAFETY: inside our reservation.
+            let at = unsafe { VirtualAlloc(at as *const _, PAGE, MEM_COMMIT, PAGE_READWRITE) } as usize;
+            assert_ne!(at, 0);
+        }
+        title_memory_reserved(p, SIZE, true, false);
+        // SAFETY: committed pages of ours.
+        unsafe { ((b + 8) as *mut u8).write_volatile(1) };
+        if !once() {
+            return; // VICTORY_ASK_ONCE=0: no submission's asking
+        }
+        ask_once(&[(a, a + PAGE), (b, b + PAGE)]);
+        let middle = p + SIZE / 2;
+        assert_eq!(asked(middle, middle + PAGE).is_some(), crate::l8ww::by_reservation());
+        let (now, written) = writes(b, b + PAGE, false).expect("watched");
+        assert_eq!(written, [(b / PAGE, now)]);
+        ask_once_end();
+        // The reservation stays (see `drop_placeholder`); forgotten here.
+        title_memory_reserved(p, SIZE, false, false);
     }
 
     /// A placeholder of `blocks` blocks and a pagefile section as big,

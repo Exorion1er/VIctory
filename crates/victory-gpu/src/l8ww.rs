@@ -12,7 +12,7 @@
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 
 /// The switches: name, on by default.
-const SWITCHES: &[(&str, bool)] = &[("WW_KNOWN_VIEWS", true), ("WW_ABSENT_TRUST", true)];
+const SWITCHES: &[(&str, bool)] = &[("WW_KNOWN_VIEWS", true), ("WW_ABSENT_TRUST", true), ("WW_BY_RESERVATION", false)];
 
 /// Whether switch `name` (`VICTORY_L8_<name>`) is on.
 fn read(name: &str, default: bool) -> bool {
@@ -75,6 +75,18 @@ pub(crate) fn known_views() -> bool {
 /// committed without a word, and the query stays.
 pub(crate) fn absent_trust() -> bool {
     on("WW_ABSENT_TRUST") && on_wine()
+}
+
+/// `VICTORY_L8_WW_BY_RESERVATION` (off): a submission's write-watch asking
+/// covers all its ranges in one write-watched reservation of the runtime's
+/// with one call (up to 1 GiB), however far apart they lie, instead of one
+/// call per group of ranges within 8 MiB of each other. Fewer calls, each
+/// waiting for the address space's lock once; but under GE-Proton 11's
+/// kernel write watch (`PAGEMAP_SCAN`) a call walks the whole range, about
+/// 0.33 us per MiB (330 us for 1 GiB against 2 us for 4 MiB, `bench`), so
+/// it pays only while the waits are long.
+pub(crate) fn by_reservation() -> bool {
+    on("WW_BY_RESERVATION")
 }
 
 /// Whether we run under Wine (its ntdll exports `wine_get_version`).
@@ -175,6 +187,11 @@ pub(crate) fn waited<T>(count: Count, lock: impl FnOnce() -> T) -> T {
 
 /// The line, over `frames` frames; the counts start again.
 pub(crate) fn log(frames: f64) {
+    tracing::info!("{}", line(frames));
+}
+
+/// [`log`]'s text.
+pub(crate) fn line(frames: f64) -> String {
     let f = frames.max(1.0);
     let calls: [f64; SITES] = std::array::from_fn(|i| CALLS[i].swap(0, Relaxed) as f64 / f);
     let ms: [f64; SITES] = std::array::from_fn(|i| MICROS[i].swap(0, Relaxed) as f64 / 1e3 / f);
@@ -189,7 +206,7 @@ pub(crate) fn log(frames: f64) {
     let (set, set_ms) = s(Site::WorkingSet);
     let (read, read_ms) = s(Site::Read);
     let (fault, fault_ms) = s(Site::Fault);
-    tracing::info!(
+    format!(
         "lot 8 per frame: GetWriteWatch {ok:.0} answered {ok_ms:.2} ms, {failed:.0} failed {failed_ms:.2} ms, {:.0} not made \
          (view memory, WW_KNOWN_VIEWS); \
          guard checks {guard:.0} {guard_ms:.2} ms; VirtualProtect {protect:.0} read-only {protect_ms:.2} ms, \
@@ -203,5 +220,340 @@ pub(crate) fn log(frames: f64) {
         c[Count::FaultsAgain as usize],
         c[Count::GuardsWaitUs as usize] / 1e3,
         c[Count::JournalWaitUs as usize] / 1e3,
-    );
+    )
+}
+
+/// Micro-benchmark of the old and new ways (ignored; run alone, once per
+/// switch setting, under the Wine to be measured):
+/// `victory_gpu-*.exe l8ww::bench --ignored --nocapture --test-threads=1`.
+/// A synthetic layout like the title's world: `L8_BENCH_VIEWS` (20,000)
+/// views of 64 KiB in a placeholder, a write-watched reservation of 1 GiB
+/// with 3,000 windows of 4 MiB over it, 1,000 windows of 1 MiB over the
+/// views; a thread writing title memory and one remapping views as the
+/// runtime does, while the main thread runs 48 submissions a frame of
+/// 1,000 refreshes each through the journal and the guards.
+#[cfg(test)]
+mod bench {
+    use crate::watch;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
+    use std::time::{Duration, Instant};
+    use windows_sys::Win32::System::Memory::{
+        CreateFileMappingW, MEM_COMMIT, MEM_PRESERVE_PLACEHOLDER, MEM_RELEASE, MEM_REPLACE_PLACEHOLDER,
+        MEM_RESERVE, MEM_RESERVE_PLACEHOLDER, MEMORY_BASIC_INFORMATION, MEMORY_MAPPED_VIEW_ADDRESS,
+        MapViewOfFile3, PAGE_NOACCESS, PAGE_READONLY, PAGE_READWRITE, UnmapViewOfFile2, VirtualAlloc,
+        VirtualAlloc2, VirtualFree, VirtualProtect, VirtualQuery,
+    };
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+
+    const K64: usize = 64 << 10;
+    const MEM_WRITE_WATCH: u32 = 0x20_0000;
+    const WATCHED: usize = 1 << 30;
+    const WINDOW: usize = 4 << 20;
+    const WATCHED_WINDOWS: usize = 3000;
+    const VIEW_WINDOW: usize = 1 << 20;
+    const VIEW_WINDOWS: usize = 1000;
+    const SUBMISSIONS: usize = 48;
+    const REFRESHES: usize = 1000;
+    const TEXTURES: usize = 20;
+    const HOT_PAGES: usize = 4096;
+
+    fn env(name: &str, default: usize) -> usize {
+        std::env::var(name).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
+    }
+
+    struct Rng(u64);
+    impl Rng {
+        fn next(&mut self) -> usize {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0 as usize
+        }
+        fn below(&mut self, n: usize) -> usize {
+            self.next() % n
+        }
+    }
+
+    struct Layout {
+        watched: usize,
+        views: usize,
+        count: usize,
+        section: usize,
+    }
+
+    fn map(l: &Layout, i: usize) {
+        let at = l.views + i * K64;
+        // SAFETY: a placeholder block of ours, the section's block i.
+        let view = unsafe {
+            MapViewOfFile3(
+                l.section as _,
+                GetCurrentProcess(),
+                at as *const _,
+                (i * K64) as u64,
+                K64,
+                MEM_REPLACE_PLACEHOLDER,
+                PAGE_READWRITE,
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        assert_eq!(view.Value as usize, at, "map view {i}");
+        crate::title_memory_remapped(at, K64);
+        crate::inplace::title_memory_view(at, K64, l.section, (i * K64) as u64);
+    }
+
+    fn unmap(l: &Layout, i: usize) {
+        let at = l.views + i * K64;
+        crate::title_memory_remapped(at, K64);
+        // SAFETY: a view of ours, back to a placeholder.
+        unsafe {
+            UnmapViewOfFile2(
+                GetCurrentProcess(),
+                MEMORY_MAPPED_VIEW_ADDRESS { Value: at as *mut _ },
+                MEM_PRESERVE_PLACEHOLDER,
+            )
+        };
+    }
+
+    fn layout() -> Layout {
+        let count = env("L8_BENCH_VIEWS", 20_000);
+        let started = Instant::now();
+        // SAFETY: fresh reservations and section, kept for the process.
+        let (watched, views, section) = unsafe {
+            let watched = VirtualAlloc(
+                std::ptr::null(),
+                WATCHED,
+                MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH,
+                PAGE_READWRITE,
+            ) as usize;
+            assert_ne!(watched, 0);
+            let views = VirtualAlloc2(
+                GetCurrentProcess(),
+                std::ptr::null(),
+                count * K64,
+                MEM_RESERVE | MEM_RESERVE_PLACEHOLDER,
+                PAGE_NOACCESS,
+                std::ptr::null_mut(),
+                0,
+            ) as usize;
+            assert_ne!(views, 0);
+            let bytes = (count * K64) as u64;
+            let section = CreateFileMappingW(
+                -1isize as _,
+                std::ptr::null(),
+                PAGE_READWRITE,
+                (bytes >> 32) as u32,
+                bytes as u32,
+                std::ptr::null(),
+            ) as usize;
+            assert_ne!(section, 0);
+            for i in 0..count - 1 {
+                VirtualFree((views + i * K64) as *mut _, K64, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER);
+            }
+            (watched, views, section)
+        };
+        crate::title_memory_reserved(watched, WATCHED, true, false);
+        crate::title_memory_reserved(views, count * K64, false, true);
+        let l = Layout { watched, views, count, section };
+        for i in 0..count {
+            map(&l, i);
+        }
+        eprintln!("layout: {count} views mapped in {:.1} s", started.elapsed().as_secs_f64());
+        l
+    }
+
+    /// Microseconds per call of `f`, over `n` calls: mean and the worst.
+    fn per_call(n: usize, mut f: impl FnMut(usize)) -> (f64, f64) {
+        let mut worst = 0f64;
+        let all = Instant::now();
+        for i in 0..n {
+            let one = Instant::now();
+            f(i);
+            worst = worst.max(one.elapsed().as_secs_f64() * 1e6);
+        }
+        (all.elapsed().as_secs_f64() * 1e6 / n as f64, worst)
+    }
+
+    fn raw(l: &Layout, rng: &mut Rng, what: &str) {
+        use windows_sys::Win32::System::Diagnostics::Debug::ReadProcessMemory;
+        use windows_sys::Win32::System::Memory::GetWriteWatch;
+        let mut found = vec![0usize; WATCHED / 4096];
+        let mut gww = |at: usize, len: usize| {
+            let (mut count, mut granularity) = (len / 4096, 0u32);
+            // SAFETY: the answer buffer holds `count` entries.
+            unsafe { GetWriteWatch(1, at as *const _, len, found.as_mut_ptr().cast(), &mut count, &mut granularity) }
+        };
+        let n = 2000;
+        let w4 = per_call(n, |_| {
+            let at = l.watched + rng.below(WATCHED / WINDOW) * WINDOW;
+            gww(at, WINDOW);
+        });
+        let w1g = per_call(50, |_| {
+            gww(l.watched, WATCHED);
+        });
+        let mut rng2 = Rng(rng.next() as u64 | 1);
+        let failed = per_call(n, |_| {
+            let at = l.views + rng2.below(l.count) * K64;
+            gww(at, K64);
+        });
+        let protect = per_call(n, |_| {
+            let at = l.views + rng2.below(l.count) * K64;
+            let mut old = 0;
+            // SAFETY: a view of ours; back to read-write below.
+            unsafe {
+                VirtualProtect(at as *const _, K64, PAGE_READONLY, &mut old);
+                VirtualProtect(at as *const _, K64, PAGE_READWRITE, &mut old);
+            }
+        });
+        let query = per_call(n, |_| {
+            let at = l.views + rng2.below(l.count) * K64;
+            // SAFETY: plain data.
+            let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+            // SAFETY: a valid out pointer.
+            unsafe { VirtualQuery(at as *const _, &mut info, size_of_val(&info)) };
+        });
+        let mut buf = vec![0u8; K64];
+        let read = per_call(n, |_| {
+            let at = l.views + rng2.below(l.count) * K64;
+            let mut done = 0;
+            // SAFETY: our buffer of K64 bytes.
+            unsafe { ReadProcessMemory(GetCurrentProcess(), at as *const _, buf.as_mut_ptr().cast(), K64, &mut done) };
+        });
+        let copy = per_call(n, |_| {
+            let at = l.views + rng2.below(l.count) * K64;
+            let _mapped = watch::title_memory_reading();
+            // SAFETY: a mapped view (no remapping under the read lock).
+            unsafe { std::ptr::copy_nonoverlapping(at as *const u8, buf.as_mut_ptr(), K64) };
+        });
+        eprintln!(
+            "raw calls {what}, us per call (mean / worst): GetWriteWatch+reset 4 MiB {:.1}/{:.0}, 1 GiB {:.1}/{:.0}, \
+             failing (view) {:.1}/{:.0}; VirtualProtect read-only + back (64 KiB view) {:.1}/{:.0}; VirtualQuery \
+             {:.1}/{:.0}; ReadProcessMemory 64 KiB {:.1}/{:.0}; memcpy 64 KiB {:.1}/{:.0}",
+            w4.0, w4.1, w1g.0, w1g.1, failed.0, failed.1, protect.0, protect.1, query.0, query.1, read.0, read.1,
+            copy.0, copy.1
+        );
+    }
+
+    /// The title: a thread writing memory (hot pages of the watched
+    /// reservation, blocks of the views) and one remapping views.
+    fn title(l: &Arc<Layout>, stop: &Arc<AtomicBool>, remaps: &Arc<[AtomicU64; 2]>) -> Vec<std::thread::JoinHandle<()>> {
+        let writer = {
+            let (l, stop) = (l.clone(), stop.clone());
+            std::thread::spawn(move || {
+                let mut rng = Rng(0x9e37_79b9_7f4a_7c15);
+                let hot: Vec<usize> = (0..HOT_PAGES).map(|_| rng.below(WATCHED / 4096)).collect();
+                while !stop.load(Relaxed) {
+                    for _ in 0..20 {
+                        let page = hot[rng.below(HOT_PAGES)];
+                        // SAFETY: committed memory of ours.
+                        unsafe { ((l.watched + page * 4096) as *mut u8).write_volatile(1) };
+                    }
+                    {
+                        let _mapped = watch::title_memory_reading();
+                        let at = l.views + rng.below(l.count) * K64 + 64;
+                        // SAFETY: a mapped view (no remapping under the
+                        // read lock); a guard's fault is taken.
+                        unsafe { (at as *mut u8).write_volatile(1) };
+                    }
+                    std::thread::sleep(Duration::from_micros(500));
+                }
+            })
+        };
+        let remapper = {
+            let (l, stop, remaps) = (l.clone(), stop.clone(), remaps.clone());
+            std::thread::spawn(move || {
+                let mut rng = Rng(0x2545_f491_4f6c_dd1d);
+                while !stop.load(Relaxed) {
+                    let i = rng.below(l.count);
+                    let started = Instant::now();
+                    {
+                        let _changing = watch::title_memory_remapping();
+                        unmap(&l, i);
+                        map(&l, i);
+                    }
+                    remaps[0].fetch_add(1, Relaxed);
+                    remaps[1].fetch_add(started.elapsed().as_micros() as u64, Relaxed);
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+            })
+        };
+        vec![writer, remapper]
+    }
+
+    /// One frame of submissions; its microseconds.
+    fn frame(l: &Layout, rng: &mut Rng, windows: &[(usize, usize)]) -> u64 {
+        let started = Instant::now();
+        for _ in 0..SUBMISSIONS {
+            let picks: Vec<(usize, usize)> = (0..REFRESHES).map(|_| windows[rng.below(windows.len())]).collect();
+            let mut spans = picks.clone();
+            spans.sort_unstable();
+            spans.dedup();
+            watch::ask_once(&spans);
+            for &(from, to) in &picks {
+                std::hint::black_box(watch::writes(from, to, true));
+            }
+            for _ in 0..TEXTURES {
+                let at = l.views + rng.below(l.count - 16) * K64;
+                if watch::writes(at, at + VIEW_WINDOW, false).is_none() {
+                    std::hint::black_box(watch::writes(at, at + VIEW_WINDOW, true));
+                }
+            }
+            watch::ask_once_end();
+        }
+        started.elapsed().as_micros() as u64
+    }
+
+    #[test]
+    #[ignore]
+    fn bench() {
+        super::announce();
+        eprintln!(
+            "switches: {}",
+            super::SWITCHES
+                .iter()
+                .zip(super::switches())
+                .map(|((n, _), on)| format!("{n}={}", if *on { "on" } else { "off" }))
+                .collect::<Vec<_>>()
+                .join(" ")
+        );
+        let l = Arc::new(layout());
+        let mut rng = Rng(0x1234_5678_9abc_def1);
+        raw(&l, &mut rng, "(quiet)");
+        let mut windows: Vec<(usize, usize)> = (0..WATCHED_WINDOWS)
+            .map(|_| {
+                let at = l.watched + rng.below((WATCHED - WINDOW) / K64) * K64;
+                (at, at + WINDOW)
+            })
+            .collect();
+        windows.extend((0..VIEW_WINDOWS).map(|_| {
+            let at = l.views + rng.below(l.count - VIEW_WINDOW / K64) * K64;
+            (at, at + VIEW_WINDOW)
+        }));
+        let stop = Arc::new(AtomicBool::new(false));
+        let remaps = Arc::new([AtomicU64::new(0), AtomicU64::new(0)]);
+        let threads = title(&l, &stop, &remaps);
+        raw(&l, &mut rng, "(title writing and remapping)");
+        // Warm: every window taken once.
+        frame(&l, &mut rng, &windows);
+        let _ = super::line(1.0);
+        let (r0, r1) = (remaps[0].load(Relaxed), remaps[1].load(Relaxed));
+        let frames = env("L8_BENCH_FRAMES", 10);
+        let mut times: Vec<u64> = (0..frames).map(|_| frame(&l, &mut rng, &windows)).collect();
+        times.sort_unstable();
+        let (n, us) = (remaps[0].load(Relaxed) - r0, remaps[1].load(Relaxed) - r1);
+        eprintln!(
+            "frames: median {:.1} ms, best {:.1} ms, worst {:.1} ms of tracking per frame ({SUBMISSIONS} submissions of \
+             {REFRESHES} refreshes + {TEXTURES} texture checks); the title's remaps meanwhile: {n}, {:.0} us each",
+            times[frames / 2] as f64 / 1e3,
+            times[0] as f64 / 1e3,
+            times[frames - 1] as f64 / 1e3,
+            us as f64 / n.max(1) as f64
+        );
+        eprintln!("{}", super::line(frames as f64));
+        stop.store(true, Relaxed);
+        for t in threads {
+            t.join().unwrap();
+        }
+    }
 }
