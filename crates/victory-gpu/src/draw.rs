@@ -319,6 +319,23 @@ pub(crate) fn take_dropped() -> u64 {
 /// A root SRV's dynamic slot in a list, and the host copy it shows.
 type RootSlot = (u32, Option<std::sync::Arc<crate::shadow::Shadow>>);
 
+/// Takes `more` from the time a run may spend bringing in a long queue of
+/// textures at more than the usual pace; whether some is left.
+/// `VICTORY_TEXTURE_GATE_S` sets it (0: none).
+fn catching_up(more: std::time::Duration) -> bool {
+    static SPENT: AtomicU64 = AtomicU64::new(0);
+    static TOTAL: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    let total = *TOTAL.get_or_init(|| {
+        let seconds = std::env::var("VICTORY_TEXTURE_GATE_S")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .unwrap_or(60);
+        seconds * 1000
+    });
+    let more = more.as_millis() as u64;
+    SPENT.fetch_add(more, Ordering::Relaxed) + more < total
+}
+
 /// Buffer views of the heap whose slot showed another host buffer than
 /// the copy the pass brought up to date for them, since the start
 /// (diagnostics; for the memory line). It stays 0 while the pass and the
@@ -1532,8 +1549,13 @@ impl State {
         if !*ON.get_or_init(|| std::env::var_os("VICTORY_HEAP_TEXTURES").is_none_or(|v| v != "0")) {
             return;
         }
-        /// Bytes of texture memory staged per frame.
+        /// Bytes of texture memory staged per frame, and while the queue is
+        /// long (the world's first minutes: over 20,000 slots, which at the
+        /// usual pace took three and a half minutes with the materials
+        /// black) as much more as `CATCH_UP` in all allows.
         const PER_FRAME: u64 = 192 << 20;
+        const PER_FRAME_CATCHING_UP: u64 = 512 << 20;
+        const LONG: u64 = 2_000;
         static FRAME: AtomicU64 = AtomicU64::new(u64::MAX);
         static SPENT: AtomicU64 = AtomicU64::new(0);
         let frame = crate::frame::current();
@@ -1594,9 +1616,15 @@ impl State {
         // 1.6-2.2 s of each of the world's first twenty frames (run 20).
         // The rest waits for the next frames, as it does past the bytes.
         const SPAN: std::time::Duration = std::time::Duration::from_millis(250);
+        const SPAN_CATCHING_UP: std::time::Duration = std::time::Duration::from_millis(1500);
+        let (per_frame, span) = if census[0] > LONG && catching_up(std::time::Duration::ZERO) {
+            (PER_FRAME_CATCHING_UP, SPAN_CATCHING_UP)
+        } else {
+            (PER_FRAME, SPAN)
+        };
         let began = std::time::Instant::now();
         for (index, write) in due {
-            if SPENT.load(Ordering::Relaxed) >= PER_FRAME || began.elapsed() > SPAN {
+            if SPENT.load(Ordering::Relaxed) >= per_frame || began.elapsed() > span {
                 break;
             }
             // A placed texture whose memory is not mapped (not streamed in
@@ -1733,6 +1761,7 @@ impl State {
                 host.texture_slot_recheck(index, frame, (at, len), crate::texture::fingerprint(at, len));
             }
         }
+        catching_up(began.elapsed().saturating_sub(SPAN));
     }
 
     /// For the frame listing, after a dropped dispatch's line: its group
