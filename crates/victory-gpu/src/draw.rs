@@ -363,10 +363,12 @@ pub(crate) static HEAP_TEXTURES_FULL: AtomicU64 = AtomicU64::new(0);
 pub(crate) static HEAP_TEXTURES_RECHECKED: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
 
 /// Whether textures picked by index are looked at again after their upload
-/// (`VICTORY_HEAP_RECHECK=0`: no).
+/// (`VICTORY_HEAP_RECHECK=1`: yes; off otherwise). Opt-in since run 30 (RX
+/// 9070 XT, RADV): with it on, characters' face skin textures were black;
+/// with it off (run 29), they were drawn.
 fn heap_recheck() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_HEAP_RECHECK").is_none_or(|v| v != "0"))
+    *ON.get_or_init(|| std::env::var_os("VICTORY_HEAP_RECHECK").is_some_and(|v| v == "1"))
 }
 
 /// Times a placed texture's slot was passed over because its memory is not

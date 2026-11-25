@@ -869,15 +869,17 @@ fn protect_alias(g: &mut Guards, from: usize, to: usize, unclean: bool) {
 /// ([`alias_unclean`]).
 const MANY_VIEWS: usize = 64;
 
-/// `VICTORY_L9_ALIAS_UNCLEAN` (on unless `0`): the other views of a page a
+/// `VICTORY_L9_ALIAS_UNCLEAN` (off unless `1`): the other views of a page a
 /// guard arms are made read-only without being noted clean, and pages of
 /// more than [`MANY_VIEWS`] views are not armed at their other views
-/// ([`protect`]). `0`: every view noted clean, every page's views armed,
-/// as before. Read first outside the guards' lock ([`guard_timed`]).
+/// ([`protect`]). Off: every view noted clean, every page's views armed,
+/// as in lot 8b. Read first outside the guards' lock ([`guard_timed`]).
+/// Opt-in since run 28 (RX 9070 XT, RADV): on, characters' face geometry
+/// was missing (floating eyes and mouths); off (run 30), faces were drawn.
 fn alias_unclean() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
-        let on = std::env::var_os("VICTORY_L9_ALIAS_UNCLEAN").is_none_or(|v| v != "0");
+        let on = std::env::var_os("VICTORY_L9_ALIAS_UNCLEAN").is_some_and(|v| v == "1");
         tracing::info!(on, "VICTORY_L9_ALIAS_UNCLEAN: other views of a guarded page armed without being noted clean");
         on
     })
@@ -2141,7 +2143,8 @@ mod tests {
         drop_views(section, &[guarded, other], SIZE);
     }
 
-    /// `VICTORY_L9_ALIAS_UNCLEAN`: a write through one view opens both; a
+    /// `VICTORY_L9_ALIAS_UNCLEAN=1` (checked only when the run sets it): a
+    /// write through one view opens both; a
     /// check at the other view then arms this one again without noting it
     /// clean, so this view's own next check still reports the write (noted
     /// clean, its copy kept the bytes from before).
