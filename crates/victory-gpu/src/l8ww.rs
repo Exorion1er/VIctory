@@ -12,7 +12,7 @@
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 
 /// The switches: name, on by default.
-const SWITCHES: &[(&str, bool)] = &[("WW_KNOWN_VIEWS", true), ("WW_ABSENT_TRUST", true), ("WW_BY_RESERVATION", false)];
+const SWITCHES: &[(&str, bool)] = &[("WW_KNOWN_VIEWS", true), ("WW_ABSENT_TRUST", true), ("WW_BY_RESERVATION", false), ("WW_PROTECT_RUNS", true)];
 
 /// Whether switch `name` (`VICTORY_L8_<name>`) is on.
 fn read(name: &str, default: bool) -> bool {
@@ -87,6 +87,15 @@ pub(crate) fn absent_trust() -> bool {
 /// it pays only while the waits are long.
 pub(crate) fn by_reservation() -> bool {
     on("WW_BY_RESERVATION")
+}
+
+/// `VICTORY_L8_WW_PROTECT_RUNS` (on): the guards change protections a run
+/// of blocks at a time, cut where the runtime's views begin and end. A run
+/// across views was asked first and refused (a protection change stays in
+/// one view), then done block by block; the other views of guarded pages
+/// were armed, and every opening done, one block per call.
+pub(crate) fn protect_runs() -> bool {
+    on("WW_PROTECT_RUNS")
 }
 
 /// Whether we run under Wine (its ntdll exports `wine_get_version`).

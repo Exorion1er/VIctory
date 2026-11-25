@@ -621,6 +621,27 @@ fn is_view(start: usize, end: usize) -> bool {
 /// one of those is this memory written, and only a fault can say so.
 fn protect(g: &mut Guards, from: usize, to: usize) {
     protect_here(g, from, to);
+    if crate::l8ww::protect_runs() {
+        let mut aliases: Vec<usize> = Vec::new();
+        for (base, bytes) in crate::inplace::views_between(from.saturating_mul(BLOCK), to.saturating_mul(BLOCK)) {
+            let first = (base / BLOCK).max(from);
+            let last = (base.saturating_add(bytes).div_ceil(BLOCK)).min(to);
+            for block in first..last {
+                aliases.extend(
+                    crate::inplace::pages_of(block * BLOCK)
+                        .into_iter()
+                        .map(|alias| alias / BLOCK)
+                        .filter(|&alias| alias != block),
+                );
+            }
+        }
+        aliases.sort_unstable();
+        aliases.dedup();
+        for (a, b) in view_runs(&aliases) {
+            protect_here(g, a, b);
+        }
+        return;
+    }
     for (base, bytes) in crate::inplace::views_between(from.saturating_mul(BLOCK), to.saturating_mul(BLOCK)) {
         let first = (base / BLOCK).max(from);
         let last = (base.saturating_add(bytes).div_ceil(BLOCK)).min(to);
@@ -635,8 +656,58 @@ fn protect(g: &mut Guards, from: usize, to: usize) {
     }
 }
 
+/// Runs of the blocks `blocks` (in order, no repeats): consecutive blocks,
+/// cut where the runtime's views begin and end (memory between views is a
+/// run of its own).
+fn view_runs(blocks: &[usize]) -> Vec<(usize, usize)> {
+    let mut runs = Vec::new();
+    let mut i = 0;
+    while i < blocks.len() {
+        let mut k = i + 1;
+        while k < blocks.len() && blocks[k] == blocks[k - 1] + 1 {
+            k += 1;
+        }
+        cut_at_views(blocks[i], blocks[k - 1] + 1, &mut runs);
+        i = k;
+    }
+    runs
+}
+
+/// Blocks `[from, to)` cut where the runtime's views begin and end.
+fn cut_at_views(from: usize, to: usize, runs: &mut Vec<(usize, usize)>) {
+    let mut at = from;
+    for (base, bytes) in crate::inplace::views_between(from.saturating_mul(BLOCK), to.saturating_mul(BLOCK)) {
+        let (start, end) = ((base / BLOCK).clamp(at, to), base.saturating_add(bytes).div_ceil(BLOCK).min(to));
+        if start > at {
+            runs.push((at, start));
+            at = start;
+        }
+        if end > at {
+            runs.push((at, end));
+            at = end;
+        }
+    }
+    if at < to {
+        runs.push((at, to));
+    }
+}
+
 /// [`protect`] for one range, without the other views of its pages.
 fn protect_here(g: &mut Guards, from: usize, to: usize) {
+    if crate::l8ww::protect_runs() {
+        let mut runs = Vec::new();
+        cut_at_views(from, to, &mut runs);
+        for (a, b) in runs {
+            protect_one(g, a, b);
+        }
+    } else {
+        protect_one(g, from, to);
+    }
+}
+
+/// [`protect_here`] for blocks `[from, to)`: in one call, or block by block
+/// if that is refused.
+fn protect_one(g: &mut Guards, from: usize, to: usize) {
     use windows_sys::Win32::System::Memory::{PAGE_READONLY, VirtualProtect};
     let set = |from: usize, to: usize| {
         let mut old = 0;
@@ -726,14 +797,29 @@ fn open_here(g: &mut Guards, start: usize, end: usize) -> bool {
         .range(start / BLOCK..end.div_ceil(BLOCK))
         .copied()
         .collect();
+    let set = |from: usize, to: usize| {
+        let mut old = 0;
+        // SAFETY: blocks we made read-only.
+        crate::l8ww::timed(crate::l8ww::Site::Open, || unsafe {
+            VirtualProtect((from * BLOCK) as *const _, (to - from) * BLOCK, PAGE_READWRITE, &mut old) != 0
+        })
+    };
     for &block in &blocks {
         g.protected.remove(&block);
         g.clean.remove(&block);
-        let mut old = 0;
-        // SAFETY: a block we made read-only.
-        crate::l8ww::timed(crate::l8ww::Site::Open, || unsafe {
-            VirtualProtect((block * BLOCK) as *const _, BLOCK, PAGE_READWRITE, &mut old)
-        });
+    }
+    if crate::l8ww::protect_runs() {
+        for (from, to) in view_runs(&blocks) {
+            if !set(from, to) && to - from > 1 {
+                for block in from..to {
+                    set(block, block + 1);
+                }
+            }
+        }
+    } else {
+        for &block in &blocks {
+            set(block, block + 1);
+        }
     }
     !blocks.is_empty()
 }
