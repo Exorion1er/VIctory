@@ -86,6 +86,9 @@ fn build() -> &'static [u8; 32] {
             "VICTORY_WAVE_LOCAL",
             "VICTORY_MESH_OUTPUT_STRICT",
             "VICTORY_STRICT_JOINS",
+            // the wave switches of the 64-lane pixel forms
+            "VICTORY_HOST_WAVE",
+            "VICTORY_PS_HALVES",
         ] {
             match std::env::var_os(name) {
                 None => key.update(&[0]),
