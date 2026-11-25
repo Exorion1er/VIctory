@@ -450,3 +450,195 @@ fn scc_of_a_mask_operation_joined_with_a_scalar_test_needs_the_skip_wave_wide() 
     }
     eprintln!("ran on the hardware device: the inner test's SCC for every lane once some lane is inside");
 }
+
+// ---- Console wave64 compute on a host of 64-lane waves (AMD: RADV runs compute at 64) ----
+// The reductions the title's newly translated passes use (compute_graph_ops'
+// CS_TransposeVecMatMulAlignedOperation: f16; water_shading's
+// CS_TransmissionVolumetrics_Tiled: f32 and f64), inside a branch some lanes skip, run on the
+// card in one host wave of 64 and checked against the console's sums.
+
+/// `native` lowered for a host of 64-lane waves (one host wave per console wave64).
+fn lowered_on_64(native: &NativeProgram, p: &ir::Program) -> Result<HostShader, ShaderError> {
+    let st = structure::structure(p).expect("structure");
+    let res = resource::track(p, &native.layout, native.stage, Some(&st)).expect("resource::track");
+    let io = io::raise(p, native).expect("io::raise");
+    let was = lower::TEST_HOST_WAVE.replace(Some(64));
+    let lowered = lower::lower(&lower::Parts {
+        native,
+        p,
+        st: &st,
+        io: &io,
+        res: &res,
+        inputs: Vec::new(),
+        outputs: Vec::new(),
+        prims: Vec::new(),
+        mesh_stride: 0,
+    });
+    lower::TEST_HOST_WAVE.set(was);
+    let lowered = lowered?;
+    let shader = HostShader {
+        stage: HwStage::Cs,
+        dxil: lowered.dxil,
+        user_data: lowered.user_data,
+        samplers: lowered.samplers,
+        static_samplers: Vec::new(),
+        root_cbvs: lowered.root_cbvs,
+        root_srvs: lowered.root_srvs,
+        root_uavs: lowered.root_uavs,
+        root_indexed_views: res.root_indexed_views,
+    };
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        let mut copy = shader.dxil.clone();
+        v.validate(&mut copy).expect("DXIL validation failed");
+    }
+    Ok(shader)
+}
+
+/// `setup`, then `if (t < s0) { reduce; v0 = s7; store v0 }` with `reduce` the console's
+/// whole-wave expansion (`WAVE_OR_V7_TO_S7` with VOP2 opcode `op` for `v_or_b32`).
+fn reduction_in_a_branch(setup: &[u32], op: u32) -> NativeProgram {
+    let mut words = setup.to_vec();
+    words.extend_from_slice(&[
+        0x7D88_0000, // v_cmp_gt_u32 vcc, s0, v0
+        0xBE8C_246A, // s_and_saveexec_b64 s[12:13], vcc
+        0xBF88_0000 | 23, // s_cbranch_execz to the restore of EXEC
+    ]);
+    words.extend(
+        super::wave::WAVE_OR_V7_TO_S7
+            .iter()
+            .map(|&w| if w >> 25 == 28 { w & 0x01FF_FFFF | op << 25 } else { w }),
+    );
+    words.extend_from_slice(&[
+        0x7E00_0207, // v_mov_b32 v0, s7
+        0x38 << 26 | 0x1C << 18,
+        0x80 << 24 | 2 << 16, // buffer_store_dword v0, off, s[8:11], 0
+        0xBEFE_040C,          // s_mov_b64 exec, s[12:13]
+    ]);
+    native(&words)
+}
+
+const LANES_IN: [u32; 6] = [64, 63, 40, 33, 17, 1];
+
+#[test]
+fn a_16_bit_wave_sum_where_some_lanes_skip_on_64_lane_host_waves() {
+    // thread t holds the 16-bit float 0x3C00 + 37 t, as in the full-wave test
+    let setup = [
+        0x340C_0085, // v_lshlrev_b32 v6, 5, v0
+        0x340E_0082, // v_lshlrev_b32 v7, 2, v0
+        0x4A0E_0F06, // v_add_nc_u32 v7, v6, v7
+        0x4A0E_0F00, // v_add_nc_u32 v7, v0, v7
+        0x4A0E_0EFF,
+        0x0000_3C00, // v_add_nc_u32 v7, 0x3c00, v7
+    ];
+    let native = reduction_in_a_branch(&setup, 50);
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    let shader = lowered_on_64(&native, &p).expect("lower");
+    let wide = |h: u16| f32::from_bits((u32::from(h >> 10) + 112) << 23 | u32::from(h & 0x3FF) << 13);
+    let narrow = |f: f32| {
+        if f == 0.0 {
+            return 0u16;
+        }
+        let b = f.to_bits();
+        let h = ((b >> 23) - 112) << 10 | (b >> 13 & 0x3FF);
+        let rest = b & 0x1FFF;
+        (h + u32::from(rest > 0x1000 || rest == 0x1000 && h & 1 == 1)) as u16
+    };
+    let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    for n in LANES_IN {
+        let terms: Vec<u16> = (0..64u16).map(|t| if u32::from(t) < n { 0x3C00 + 37 * t } else { 0 }).collect();
+        // the console: a tree of rounded additions (lanes outside give +0)
+        let mut tree = terms.clone();
+        while tree.len() > 1 {
+            tree = tree.chunks(2).map(|c| narrow(wide(c[0]) + wide(c[1]))).collect();
+        }
+        // the translation where not every lane runs: the exact sum, rounded once
+        let exact: f32 = terms.iter().map(|&h| if h == 0 { 0.0 } else { wide(h) }).sum();
+        let once = narrow(exact);
+        let Some(got) = on_the_card(&shader, [n, 0]) else { return };
+        let got = (got & 0xFFFF) as u16;
+        assert_eq!(got, once, "{n} lanes: card {got:#x}, rounded once {once:#x}, console tree {:#x}", tree[0]);
+        assert!(got.abs_diff(tree[0]) <= 2, "{n} lanes: {got:#x} vs the console's {:#x}", tree[0]);
+    }
+    eprintln!("ran on the hardware device: 16-bit sums over the lanes that run, within 2 steps of the console's");
+}
+
+#[test]
+fn a_32_bit_wave_sum_where_some_lanes_skip_on_64_lane_host_waves() {
+    let setup = [
+        0x4A0E_0081, // v_add_nc_u32 v7, 1, v0
+        0x7E0E_0D07, // v_cvt_f32_u32 v7, v7
+    ];
+    let native = reduction_in_a_branch(&setup, 3);
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    let shader = lowered_on_64(&native, &p).expect("lower");
+    let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    for n in LANES_IN {
+        let Some(got) = on_the_card(&shader, [n, 0]) else { return };
+        let want = (n * (n + 1) / 2) as f32;
+        assert_eq!(f32::from_bits(got), want, "{n} lanes");
+    }
+    eprintln!("ran on the hardware device: 32-bit sums over the lanes that run");
+}
+
+#[test]
+fn a_64_bit_wave_sum_where_some_lanes_skip_on_64_lane_host_waves() {
+    // water_shading's lane count as a double: 1.0 from each lane in the branch, summed in
+    // f64 over the wave (DPP8, row mirror, v_permlanex16, lane 32), then v_cvt_f32_f64
+    const fn vop1(op: u32, vdst: u32, src0: u32) -> u32 {
+        0x7E00_0000 | vdst << 17 | op << 9 | src0
+    }
+    const fn vop3(op: u32, vdst: u32, src0: u32, src1: u32, src2: u32) -> [u32; 2] {
+        [0x35 << 26 | op << 16 | vdst, src0 | src1 << 9 | src2 << 18]
+    }
+    let v = |n: u32| 256 + n;
+    let dpp8 = |vdst: u32, vsrc: u32, sel: u32| [vop1(1, vdst, 0xE9), vsrc | sel << 8];
+    let mirror = |vdst: u32, vsrc: u32| {
+        [vop1(1, vdst, 0xFA), vsrc | 0x140 << 8 | 1 << 19 | 0xF << 24 | 0xF << 28]
+    };
+    let mut words = vec![
+        vop1(1, 8, 0x80), // v_mov_b32 v8, 0
+        vop1(1, 9, 0xFF),
+        0x3FF0_0000,  // v_mov_b32 v9, 0x3ff00000 (v[8:9] = 1.0)
+        0x7D88_0000,  // v_cmp_gt_u32 vcc, s0, v0
+        0xBE8C_246A,  // s_and_saveexec_b64 s[12:13], vcc
+        0xBF88_0000, // s_cbranch_execz (offset below)
+    ];
+    let branch = words.len() - 1;
+    words.push(0xBE86_25C1); // s_or_saveexec_b64 s[6:7], -1
+    words.push(vop1(1, 2, 0x80)); // v_mov_b32 v2, 0
+    words.push(vop1(1, 3, 0x80)); // v_mov_b32 v3, 0
+    words.extend_from_slice(&vop3(0x101, 2, v(2), v(8), 6)); // v_cndmask_b32 v2, v2, v8, s[6:7]
+    words.extend_from_slice(&vop3(0x101, 3, v(3), v(9), 6));
+    for sel in [14_570_689u32, 9_658_386, 2340] {
+        words.extend_from_slice(&dpp8(4, 2, sel));
+        words.extend_from_slice(&dpp8(5, 3, sel));
+        words.extend_from_slice(&vop3(0x164, 2, v(4), v(2), 0)); // v_add_f64 v[2:3], v[4:5], v[2:3]
+    }
+    words.extend_from_slice(&mirror(4, 2));
+    words.extend_from_slice(&mirror(5, 3));
+    words.extend_from_slice(&vop3(0x164, 2, v(4), v(2), 0));
+    words.extend_from_slice(&vop3(0x378, 4, v(2), 0x80, 0x80)); // v_permlanex16_b32 v4, v2, 0, 0
+    words.extend_from_slice(&vop3(0x378, 5, v(3), 0x80, 0x80));
+    words.extend_from_slice(&vop3(0x164, 2, v(4), v(2), 0));
+    words.extend_from_slice(&vop3(0x360, 16, v(2), 0xA0, 0)); // v_readlane_b32 s16, v2, 32
+    words.extend_from_slice(&vop3(0x360, 17, v(3), 0xA0, 0));
+    words.extend_from_slice(&vop3(0x164, 2, 16, v(2), 0)); // v_add_f64 v[2:3], s[16:17], v[2:3]
+    words.extend_from_slice(&vop3(0x360, 16, v(2), 0x80, 0)); // v_readlane_b32 s16, v2, 0
+    words.extend_from_slice(&vop3(0x360, 17, v(3), 0x80, 0));
+    words.push(0xBE8E_0310); // s_mov_b32 s14, s16
+    words.push(0xBE8F_0311); // s_mov_b32 s15, s17
+    words.push(0xBEFE_0406); // s_mov_b64 exec, s[6:7]
+    words.push(vop1(0x00F, 0, 14)); // v_cvt_f32_f64 v0, s[14:15]
+    words.extend_from_slice(&[0x38 << 26 | 0x1C << 18, 0x80 << 24 | 2 << 16]); // buffer_store_dword v0
+    words[branch] |= (words.len() - branch - 1) as u32;
+    words.push(0xBEFE_040C); // s_mov_b64 exec, s[12:13]
+    let native = native(&words);
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    let shader = lowered_on_64(&native, &p).expect("lower");
+    let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    for n in LANES_IN {
+        let Some(got) = on_the_card(&shader, [n, 0]) else { return };
+        assert_eq!(f32::from_bits(got), n as f32, "{n} lanes");
+    }
+    eprintln!("ran on the hardware device: 64-bit lane counts over the lanes that run");
+}

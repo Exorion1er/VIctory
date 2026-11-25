@@ -479,10 +479,20 @@ void main() {
             unsafe {
                 let factory: IDXGIFactory4 =
                     CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).ok()?;
-                let adapter: IDXGIAdapter = factory.EnumWarpAdapter().ok()?;
+                // `VICTORY_TEST_HW=1`: the first hardware adapter instead (under Proton,
+                // which has no WARP: the card behind vkd3d-proton).
+                let hw = std::env::var_os("VICTORY_TEST_HW").is_some_and(|v| v == "1");
+                let adapter: IDXGIAdapter = if hw {
+                    factory.EnumAdapters(0).ok()?
+                } else {
+                    factory.EnumWarpAdapter().ok()?
+                };
                 let desc = adapter.cast::<IDXGIAdapter1>().ok()?.GetDesc1().ok()?;
-                if desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 == 0 {
+                if !hw && desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 == 0 {
                     return None;
+                }
+                if hw {
+                    eprintln!("test harness on the hardware adapter {:04x}:{:04x}", desc.VendorId, desc.DeviceId);
                 }
                 let mut device: Option<ID3D12Device> = None;
                 D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device).ok()?;
