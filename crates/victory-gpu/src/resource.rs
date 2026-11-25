@@ -2071,6 +2071,16 @@ pub(crate) fn texture_at(address: u64, desc: &[u32; 14]) -> Option<This> {
     Some(out)
 }
 
+/// Lot 7 (`VICTORY_L7_TEXTURE_SLOTS`): whether the texture placed at
+/// `address` with resource description `desc` has a host copy now, without
+/// making the resource or its host copy ([`texture_at`] makes both on first
+/// use). Counts as a use of the host copy, which a slot then shows.
+#[cfg(windows)]
+pub(crate) fn placed_host_made(address: u64, desc: &[u32; 14]) -> bool {
+    let r = PLACED_TEXTURES.lock().unwrap_or_else(|e| e.into_inner()).get(&(address, *desc)).copied();
+    r.is_some_and(|r| hosted(r as This, false).is_some())
+}
+
 /// The resource for an unordered access view of a texture placed at
 /// `address` with resource description `desc` and view format `view_format`
 /// (0: the resource's own): an existing unordered-access texture at that

@@ -10,7 +10,7 @@ fn on(name: &str) -> bool {
     std::env::var_os(format!("VICTORY_L7_{name}")).is_none_or(|v| v != "0")
 }
 
-const NAMES: [&str; 4] = ["DYNAMIC_SLOTS", "CB_SLOTS", "VIEW_COPY_LRU", "VIEW_ADDRESS"];
+const NAMES: [&str; 5] = ["DYNAMIC_SLOTS", "CB_SLOTS", "VIEW_COPY_LRU", "VIEW_ADDRESS", "TEXTURE_SLOTS"];
 
 /// The switches, read once: (name, on).
 fn switches() -> &'static [(&'static str, bool); NAMES.len()] {
@@ -48,6 +48,14 @@ pub(crate) fn view_copy_lru() -> bool {
 /// only for buffer views of resources (`crate::draw` `host_word`).
 pub(crate) fn view_address() -> bool {
     switches()[3].1
+}
+
+/// `VICTORY_L7_TEXTURE_SLOTS`: a slot the title writes with a view of a
+/// texture it placed in memory, whose host copy is made already, is made
+/// at the write instead of read as null until the texture pass or a draw
+/// makes it (`crate::descriptor::host::HostHeap::mirror`).
+pub(crate) fn texture_slots() -> bool {
+    switches()[4].1
 }
 
 /// `VICTORY_L7_VIEW_COPY_MB`: the bytes views' own copies may take.
@@ -99,7 +107,9 @@ pub(crate) const ADDRESS_CONSTANT: usize = 2;
 pub(crate) const ADDRESS_PLACED: usize = 3;
 pub(crate) const ADDRESS_NONE: usize = 4;
 pub(crate) const ADDRESS_OTHER: usize = 5;
-const COUNTS: usize = 6;
+pub(crate) const TEXTURE_MADE: usize = 6;
+pub(crate) const TEXTURE_LATER: usize = 7;
+const COUNTS: usize = 8;
 static COUNT: [AtomicU64; COUNTS] = [const { AtomicU64::new(0) }; COUNTS];
 
 /// Gauges: views' own copies alive and their bytes.
@@ -117,7 +127,8 @@ pub(crate) fn log(frames: f64) {
         "lot 7 per frame: {:.1} constant buffer views left to the draws that read them (CB_SLOTS); views' own \
          copies: {} alive {} MB, {:.1} let go (VIEW_COPY_LRU); addresses of views taken by shaders: {:.1} of \
          constant buffers, {:.1} of views of memory (VIEW_ADDRESS), {:.1} of slots with no view of ours, {:.1} of \
-         other views (both read 0)",
+         other views (both read 0); texture slots written: {:.1} made at the write, their host copy there \
+         (TEXTURE_SLOTS), {:.1} left for the texture pass or a draw",
         f(CB_LEFT),
         OWN_ALIVE[0].load(Relaxed),
         OWN_ALIVE[1].load(Relaxed) >> 20,
@@ -126,5 +137,7 @@ pub(crate) fn log(frames: f64) {
         f(ADDRESS_PLACED),
         f(ADDRESS_NONE),
         f(ADDRESS_OTHER),
+        f(TEXTURE_MADE),
+        f(TEXTURE_LATER),
     );
 }

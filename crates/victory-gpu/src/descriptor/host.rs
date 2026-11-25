@@ -1416,6 +1416,18 @@ impl HostHeap {
                 KEPT_VIEWS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 return Some(view);
             }
+            // Lot 7 (`VICTORY_L7_TEXTURE_SLOTS`): a texture view whose
+            // texture has a host copy already (another slot or a draw made
+            // it) is made at the title's write, not left null until the
+            // texture pass or a draw that reads it through a table makes
+            // it. The pass serves what is due within a budget, the newest
+            // and oldest writes first: in run 11 its queue held 17,000-27,000
+            // slots, up to 17,363 of them due, the oldest due for 3,925
+            // frames, and a texture picked by index read nothing for as
+            // long as its slot waited there, each time the title wrote the
+            // slot again. The slot stays in the queue: the pass still
+            // brings the texture up to date.
+            let later = later && !(!for_draw && texture_ready(&view));
             made[index as usize] = if later { 0 } else { key };
             let kept = if later {
                 None
@@ -2237,6 +2249,28 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
             }
         }
     }
+}
+
+/// Lot 7 (`VICTORY_L7_TEXTURE_SLOTS`): whether `view` is a shader view of a
+/// texture the title placed in memory (not a buffer) whose host copy is
+/// made already ([`HostHeap::mirror`] makes its slot at once). Counted.
+fn texture_ready(view: &View) -> bool {
+    const BUFFER: u32 = 1;
+    const TARGET_DEPTH_UNORDERED: u32 = 0x7;
+    let &View::Placed(false, mut resource, ref desc) = view else {
+        return false;
+    };
+    if resource[0] == BUFFER || !crate::l7::texture_slots() {
+        return false;
+    }
+    // As `placed_texture` names the resource.
+    if placed_uav_mirror() {
+        resource[12] &= !TARGET_DEPTH_UNORDERED;
+    }
+    let address = u64::from(desc[10]) | u64::from(desc[11]) << 32;
+    let ready = crate::resource::placed_host_made(address, &resource);
+    crate::l7::add(if ready { crate::l7::TEXTURE_MADE } else { crate::l7::TEXTURE_LATER }, 1);
+    ready
 }
 
 /// Writes of a slot with another view of the placed texture it showed,
