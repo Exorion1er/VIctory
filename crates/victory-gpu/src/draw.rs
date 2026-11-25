@@ -710,12 +710,47 @@ impl State {
             return 0;
         }
         // The title address of the buffer view at that dword of the table.
-        let address = match self.roots_ref(compute).get(usize::from(slot)) {
-            Some(&Root::Table(table)) => crate::descriptor::view(table + u64::from(dword) * 4)
-                .and_then(|view| crate::descriptor::host::buffer_range(&view))
-                .map_or(0, |range| range.0),
-            _ => 0,
+        let view = match self.roots_ref(compute).get(usize::from(slot)) {
+            Some(&Root::Table(table)) => crate::descriptor::view(table + u64::from(dword) * 4),
+            _ => None,
         };
+        let mut address = match &view {
+            // Lot 7: counted as a constant buffer's below, whatever
+            // `buffer_range` knows (`VICTORY_L7_CB_SLOTS`).
+            Some(View::Constant(..)) if crate::l7::view_address() => 0,
+            Some(view) => crate::descriptor::host::buffer_range(view).map_or(0, |range| range.0),
+            None => 0,
+        };
+        if address == 0 && crate::l7::view_address() {
+            // Lot 7 (`VICTORY_L7_VIEW_ADDRESS`): the address of what other
+            // views say where they read: a constant buffer's start, the
+            // memory a view of memory (a texture the title placed) or a
+            // texture object lies in. Only buffer views of resources and of
+            // memory had one: run 11 read 0 for 56 a frame (slot 1, dword 8
+            // first), and the shader read title memory from address 0.
+            let (found, what) = match &view {
+                Some(View::Constant(at, _)) => (*at, crate::l7::ADDRESS_CONSTANT),
+                Some(View::Placed(_, _, desc)) => {
+                    (u64::from(desc[10]) | u64::from(desc[11]) << 32, crate::l7::ADDRESS_PLACED)
+                }
+                Some(View::Shader(r, _) | View::Unordered(r, _, _)) => (
+                    crate::resource::texture_memory(*r as This)
+                        .map(|(at, _)| at as u64)
+                        .or_else(|| crate::resource::buffer_bytes(*r as This).map(|(at, _)| at as u64))
+                        .unwrap_or(0),
+                    crate::l7::ADDRESS_PLACED,
+                ),
+                None => (0, crate::l7::ADDRESS_NONE),
+                Some(_) => (0, crate::l7::ADDRESS_OTHER),
+            };
+            let what = if found == 0 && what != crate::l7::ADDRESS_NONE { crate::l7::ADDRESS_OTHER } else { what };
+            crate::l7::add(what, 1);
+            if found == 0 {
+                let text: String = format!("{view:?}").chars().take(200).collect();
+                once!(slot, dword, view = text, "lot 7: a shader takes the address of a view that has none: it reads 0");
+            }
+            address = found;
+        }
         if address == 0 {
             crate::l6::add(crate::l6::VIEW_ADDRESS_ZERO, 1);
             once!(slot, dword, "a shader takes the address of a buffer view that is not there: it reads 0");
