@@ -697,8 +697,9 @@ fn guard_timed(start: usize, end: usize) -> Option<Vec<usize>> {
         return None;
     }
     install();
-    // Read once outside the lock (it reads the environment).
+    // Read once outside the lock (they read the environment and log).
     title_views_only();
+    alias_unclean();
     let mut g = guards();
     let mut written = Vec::new();
     let mut run: Option<usize> = None;
@@ -815,41 +816,71 @@ fn is_view(start: usize, end: usize) -> bool {
 /// noting those not committed (unmapped) absent. The same physical pages
 /// at every other view of them are made read-only too: a write through
 /// one of those is this memory written, and only a fault can say so.
+///
+/// With [`alias_unclean`] those other views are not noted clean: the
+/// copies taken through them have not taken the pages now, so noted clean
+/// they would not be reported written at their next check and would keep
+/// the bytes from before a write through this view. A page of more than
+/// [`MANY_VIEWS`] views (the page the title shows wherever it has nothing)
+/// is then left to each view's own guard.
 fn protect(g: &mut Guards, from: usize, to: usize) {
     protect_here(g, from, to);
-    if crate::l8ww::protect_runs() {
-        let mut aliases: Vec<usize> = Vec::new();
-        for (base, bytes) in crate::inplace::views_between(from.saturating_mul(BLOCK), to.saturating_mul(BLOCK)) {
-            let first = (base / BLOCK).max(from);
-            let last = (base.saturating_add(bytes).div_ceil(BLOCK)).min(to);
-            for block in first..last {
-                aliases.extend(
-                    crate::inplace::pages_of(block * BLOCK)
-                        .into_iter()
-                        .map(|alias| alias / BLOCK)
-                        .filter(|&alias| alias != block),
-                );
-            }
-        }
-        aliases.sort_unstable();
-        aliases.dedup();
-        for (a, b) in view_runs(&aliases) {
-            protect_here(g, a, b);
-        }
-        return;
-    }
+    let unclean = alias_unclean();
+    let mut aliases: Vec<usize> = Vec::new();
     for (base, bytes) in crate::inplace::views_between(from.saturating_mul(BLOCK), to.saturating_mul(BLOCK)) {
         let first = (base / BLOCK).max(from);
         let last = (base.saturating_add(bytes).div_ceil(BLOCK)).min(to);
         for block in first..last {
-            for alias in crate::inplace::pages_of(block * BLOCK) {
-                let alias = alias / BLOCK;
-                if alias != block {
-                    protect_here(g, alias, alias + 1);
-                }
+            let shown = crate::inplace::pages_of(block * BLOCK);
+            if unclean && shown.len() > MANY_VIEWS {
+                continue;
             }
+            aliases.extend(shown.into_iter().map(|alias| alias / BLOCK).filter(|&alias| alias != block));
         }
     }
+    if crate::l8ww::protect_runs() {
+        aliases.sort_unstable();
+        aliases.dedup();
+        for (a, b) in view_runs(&aliases) {
+            protect_alias(g, a, b, unclean);
+        }
+    } else {
+        for alias in aliases {
+            protect_alias(g, alias, alias + 1, unclean);
+        }
+    }
+}
+
+/// [`protect_here`] for blocks `[from, to)` of other views of pages just
+/// guarded; with `unclean`, those that were not clean stay so.
+fn protect_alias(g: &mut Guards, from: usize, to: usize, unclean: bool) {
+    let dirty: Vec<usize> = if unclean {
+        (from..to).filter(|b| !g.clean.contains(b)).collect()
+    } else {
+        Vec::new()
+    };
+    protect_here(g, from, to);
+    for block in dirty {
+        g.clean.remove(&block);
+    }
+}
+
+/// Views of one page past which its views are not guarded together
+/// ([`alias_unclean`]).
+const MANY_VIEWS: usize = 64;
+
+/// `VICTORY_L9_ALIAS_UNCLEAN` (on unless `0`): the other views of a page a
+/// guard arms are made read-only without being noted clean, and pages of
+/// more than [`MANY_VIEWS`] views are not armed at their other views
+/// ([`protect`]). `0`: every view noted clean, every page's views armed,
+/// as before. Read first outside the guards' lock ([`guard_timed`]).
+fn alias_unclean() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var_os("VICTORY_L9_ALIAS_UNCLEAN").is_none_or(|v| v != "0");
+        tracing::info!(on, "VICTORY_L9_ALIAS_UNCLEAN: other views of a guarded page armed without being noted clean");
+        on
+    })
 }
 
 /// Runs of the blocks `blocks` (in order, no repeats): consecutive blocks,
@@ -2108,6 +2139,33 @@ mod tests {
         assert_eq!(guard(guarded, guarded + SIZE), Some(vec![pages(1)]));
         assert_eq!(guard(guarded, guarded + SIZE), Some(Vec::new()));
         drop_views(section, &[guarded, other], SIZE);
+    }
+
+    /// `VICTORY_L9_ALIAS_UNCLEAN`: a write through one view opens both; a
+    /// check at the other view then arms this one again without noting it
+    /// clean, so this view's own next check still reports the write (noted
+    /// clean, its copy kept the bytes from before).
+    #[test]
+    fn a_check_at_another_view_leaves_a_write_to_this_views_check() {
+        const SIZE: usize = 2 * BLOCK;
+        let (section, first, other) = two_views(SIZE);
+        let page = |at: usize, block: usize| (at + block * BLOCK) / PAGE;
+        // Both views' copies take the pages in.
+        let _ = guard(other, other + SIZE);
+        let _ = guard(first, first + SIZE);
+        assert_eq!(guard(first, first + SIZE), Some(Vec::new()));
+        assert_eq!(guard(other, other + SIZE), Some(Vec::new()));
+        // SAFETY: the second view, read-write once the handler has opened it.
+        unsafe { ((other + BLOCK + 8) as *mut u8).write(1) };
+        assert_eq!(guard(first, first + SIZE), Some(vec![page(first, 1)]));
+        if alias_unclean() {
+            assert_eq!(
+                guard(other, other + SIZE),
+                Some(vec![page(other, 1)]),
+                "the write is still the other view's to see"
+            );
+        }
+        drop_views(section, &[first, other], SIZE);
     }
 
     /// AnyXboxX lot 9 (`VICTORY_L9_DSTORAGE_GUARDS`): a kernel write held
