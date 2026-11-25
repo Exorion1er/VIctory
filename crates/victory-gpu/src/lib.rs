@@ -39,6 +39,8 @@ mod l7unlit;
 #[cfg(windows)]
 mod l8ww;
 #[cfg(windows)]
+mod l9guard;
+#[cfg(windows)]
 mod indirect;
 #[cfg(windows)]
 mod inplace;

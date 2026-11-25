@@ -190,9 +190,16 @@ pub(crate) enum Count {
     /// AnyXboxX lot 9: blocks a check left open because a kernel write of
     /// the runtime's was under way there (`crate::watch::kernel_write`).
     HeldOpen,
+    /// AnyXboxX lot 9 fix (`VICTORY_L9_GUARD_TITLE_VIEWS`): blocks a check
+    /// left writable because no title view shows them
+    /// (`crate::watch::protect_here`).
+    NotTitle,
+    /// AnyXboxX lot 9 fix: write faults on the thread that held the guards'
+    /// lock, opened without it (`crate::watch::reentrant`).
+    Reentrant,
 }
 
-const COUNTS: usize = 7;
+const COUNTS: usize = 9;
 
 static COUNT: [AtomicU64; COUNTS] = [const { AtomicU64::new(0) }; COUNTS];
 
@@ -256,13 +263,16 @@ pub(crate) fn line(frames: f64) -> String {
          blocks known unmapped, WW_ABSENT_TRUST); QueryWorkingSetEx \
          {set:.0} {set_ms:.2} ms; ReadProcessMemory {read:.0} {read_ms:.2} ms; guard faults {fault:.0} \
          ({:.0} on a block that faulted earlier in the frame) {fault_ms:.2} ms in the handler, {:.0} guards \
-         left open to the next frame (GUARD_REARM_FRAME), {:.1} left open under a kernel write (L9_DSTORAGE_GUARDS); waits for our \
+         left open to the next frame (GUARD_REARM_FRAME), {:.1} left open under a kernel write (L9_DSTORAGE_GUARDS), {:.0} blocks no title view shows left \
+         writable (copied whole; L9_GUARD_TITLE_VIEWS), {:.2} write faults under the guards' lock; waits for our \
          locks: guards {:.2} ms, write-watch journal {:.2} ms",
         c[Count::WatchesSkipped as usize],
         c[Count::QueriesSkipped as usize],
         c[Count::FaultsAgain as usize],
         c[Count::RearmDeferred as usize],
         c[Count::HeldOpen as usize],
+        c[Count::NotTitle as usize],
+        c[Count::Reentrant as usize],
         c[Count::GuardsWaitUs as usize] / 1e3,
         c[Count::JournalWaitUs as usize] / 1e3,
     )
