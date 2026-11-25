@@ -619,7 +619,8 @@ pub(crate) fn save(now: bool) {
     // draws a frame as "being made", different ones on each start.
     let Some(library) = library() else {
         if USED_CHANGED.swap(false, Ordering::Relaxed) {
-            let used: Vec<String> = USED.lock().unwrap_or_else(|e| e.into_inner()).iter().flatten().cloned().collect();
+            // With what earlier runs listed, as below.
+            let used: Vec<String> = used().iter().flatten().cloned().collect();
             match write_atomically(&dir.join(EARLY_FILE), used.join("\n").as_bytes()) {
                 Ok(()) => tracing::info!(early = used.len(), "early pipeline list saved (no host pipeline library)"),
                 Err(e) => tracing::warn!(error = %e, "early pipeline list not saved"),
@@ -656,7 +657,10 @@ pub(crate) fn save(now: bool) {
             size
         }
     };
-    let used: Vec<String> = USED.lock().unwrap_or_else(|e| e.into_inner()).iter().flatten().cloned().collect();
+    // With what earlier runs listed: a run that asks for no title pipeline
+    // (`victory warm`) wrote an empty list over theirs, and the next world
+    // began with every pipeline still to be asked for.
+    let used: Vec<String> = used().iter().flatten().cloned().collect();
     let library_written = if bytes > 0 { replace_library(dir, &tmp) } else { Ok(()) };
     if bytes > 0 && library_written.is_ok() {
         // In place unless the system refused and the new one waits beside it.
