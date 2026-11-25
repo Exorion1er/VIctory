@@ -14,6 +14,21 @@ use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 /// The switches: name, on by default.
 const SWITCHES: &[(&str, bool)] = &[("WW_KNOWN_VIEWS", true), ("WW_ABSENT_TRUST", true), ("WW_BY_RESERVATION", false), ("WW_PROTECT_RUNS", true), ("GUARD_REARM_FRAME", false)];
 
+/// `VICTORY_L8_WW_CHUNK_MB` (0 = off): the most one `GetWriteWatch` call
+/// walks of a write-watched reservation of the runtime's; a longer asking is
+/// made in pieces. Under GE-Proton 11 a call walks its whole range
+/// (`PAGEMAP_SCAN`, about 0.33 us per MiB: 330 us for a 1 GiB heap) at a
+/// stretch, holding the address space's locks the title's mappings need;
+/// in pieces the title can get in between. The micro-benchmark saw neither
+/// gain nor loss at 64 (the title's remaps cost the same), a loss at 16:
+/// off until a run's "lot 8" line shows long answered calls.
+pub(crate) fn chunk() -> usize {
+    static MB: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *MB.get_or_init(|| {
+        std::env::var("VICTORY_L8_WW_CHUNK_MB").ok().and_then(|v| v.parse().ok()).unwrap_or(0)
+    }) << 20
+}
+
 /// Whether switch `name` (`VICTORY_L8_<name>`) is on.
 fn read(name: &str, default: bool) -> bool {
     match std::env::var_os(format!("VICTORY_L8_{name}")) {
@@ -42,13 +57,14 @@ pub(crate) fn announce() {
     ONCE.call_once(|| {
         let s = switches();
         tracing::info!(
-            "lot 8 (write watch) switches, VICTORY_L8_<NAME>=0 or =1: {}",
+            "lot 8 (write watch) switches, VICTORY_L8_<NAME>=0 or =1: {} WW_CHUNK_MB={}",
             SWITCHES
                 .iter()
                 .zip(s)
                 .map(|((n, _), on)| format!("{n}={}", if *on { "on" } else { "off" }))
                 .collect::<Vec<_>>()
-                .join(" ")
+                .join(" "),
+            chunk() >> 20
         );
     });
 }
@@ -541,6 +557,7 @@ mod bench {
                 .map(|((n, _), on)| format!("{n}={}", if *on { "on" } else { "off" }))
                 .collect::<Vec<_>>()
                 .join(" ")
+                + &format!(" WW_CHUNK_MB={}", super::chunk() >> 20)
         );
         let l = Arc::new(layout());
         let mut rng = Rng(0x1234_5678_9abc_def1);
@@ -564,7 +581,18 @@ mod bench {
         let _ = super::line(1.0);
         let (r0, r1) = (remaps[0].load(Relaxed), remaps[1].load(Relaxed));
         let frames = env("L8_BENCH_FRAMES", 10);
-        let mut times: Vec<u64> = (0..frames).map(|_| frame(&l, &mut rng, &windows)).collect();
+        // `L8_BENCH_IDLE_MS`: the main thread sleeps instead (the title's
+        // remaps alone).
+        let idle = env("L8_BENCH_IDLE_MS", 0);
+        let mut times: Vec<u64> = (0..frames)
+            .map(|_| {
+                if idle > 0 {
+                    std::thread::sleep(Duration::from_millis(idle as u64));
+                    return idle as u64 * 1000;
+                }
+                frame(&l, &mut rng, &windows)
+            })
+            .collect();
         times.sort_unstable();
         let (n, us) = (remaps[0].load(Relaxed) - r0, remaps[1].load(Relaxed) - r1);
         eprintln!(

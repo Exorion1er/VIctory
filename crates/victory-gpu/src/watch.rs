@@ -265,32 +265,21 @@ fn ask_run(j: &mut Journal, pieces: &[(usize, usize)]) {
 /// them in the journal under the ahead asking; false (and nothing changed)
 /// if the range is not write-watched memory of one reservation.
 fn ask_kernel(j: &mut Journal, first: usize, last: usize) -> bool {
-    use windows_sys::Win32::System::Memory::GetWriteWatch;
-    const WRITE_WATCH_FLAG_RESET: u32 = 1;
-    let mut count = (last - first) * PAGE / KERNEL_PAGE;
-    j.found.resize(count.max(j.found.len()), 0);
-    let mut granularity = 0;
     #[cfg(feature = "diagnostics")]
     let started = std::time::Instant::now();
-    let asking = std::time::Instant::now();
-    // SAFETY: the answer buffer holds `count` entries.
-    let failed = unsafe {
-        GetWriteWatch(
-            WRITE_WATCH_FLAG_RESET,
-            (first * PAGE) as *const _,
-            (last - first) * PAGE,
-            j.found.as_mut_ptr().cast(),
-            &mut count,
-            &mut granularity,
-        )
-    } != 0;
-    crate::l8ww::add_call(
-        if failed { crate::l8ww::Site::WatchFailed } else { crate::l8ww::Site::WatchOk },
-        asking.elapsed().as_micros() as u64,
-    );
-    if failed {
-        return false;
-    }
+    let count = match kernel_watch(&mut j.found, first, last) {
+        Ok(count) => count,
+        Err(count) => {
+            // Pieces answered before one failed: their pages were reset,
+            // and are written.
+            let now = j.ahead_asked;
+            for k in 0..count {
+                let page = j.found[k] / PAGE;
+                j.written.insert(page, now);
+            }
+            return false;
+        }
+    };
     #[cfg(feature = "diagnostics")]
     {
         use crate::copystat::{C, add};
@@ -304,6 +293,63 @@ fn ask_kernel(j: &mut Journal, first: usize, last: usize) -> bool {
         j.written.insert(page, now);
     }
     true
+}
+
+/// The kernel's written pages of pages `[first, last)`, reset, into
+/// `found`: their count, or (`Err`) the count of those found before a
+/// call failed. In pieces of `crate::l8ww::chunk` bytes in a write-watched
+/// reservation of the runtime's, a call each (under Wine each call holds
+/// the address space's lock while it walks its range); else one call.
+fn kernel_watch(found: &mut Vec<usize>, first: usize, last: usize) -> Result<usize, usize> {
+    use windows_sys::Win32::System::Memory::GetWriteWatch;
+    const WRITE_WATCH_FLAG_RESET: u32 = 1;
+    let (start, end) = (first * PAGE, last * PAGE);
+    let total = (end - start) / KERNEL_PAGE;
+    found.resize(total.max(found.len()), 0);
+    let chunk = crate::l8ww::chunk();
+    let piece = if chunk != 0 && end - start > chunk && watched_reservation(start, end) {
+        chunk
+    } else {
+        end - start
+    };
+    let mut done = 0;
+    let mut at = start;
+    while at < end {
+        let len = piece.min(end - at);
+        let mut count = len / KERNEL_PAGE;
+        let mut granularity = 0;
+        let asking = std::time::Instant::now();
+        // SAFETY: the answer buffer holds `count` entries past `done`.
+        let failed = unsafe {
+            GetWriteWatch(
+                WRITE_WATCH_FLAG_RESET,
+                at as *const _,
+                len,
+                found.as_mut_ptr().add(done).cast(),
+                &mut count,
+                &mut granularity,
+            )
+        } != 0;
+        crate::l8ww::add_call(
+            if failed { crate::l8ww::Site::WatchFailed } else { crate::l8ww::Site::WatchOk },
+            asking.elapsed().as_micros() as u64,
+        );
+        if failed {
+            return Err(done);
+        }
+        done += count;
+        at += len;
+    }
+    Ok(done)
+}
+
+/// Whether `[start, end)` lies in one write-watched reservation of the
+/// runtime's ([`title_memory_reserved`]).
+fn watched_reservation(start: usize, end: usize) -> bool {
+    let r = RESERVED.lock().unwrap_or_else(|e| e.into_inner());
+    r.range(..=start)
+        .next_back()
+        .is_some_and(|(_, &(stop, placeholder))| !placeholder && end <= stop)
 }
 
 /// What [`writes`] would say of `[start, end)` from the journal alone, if
@@ -326,8 +372,6 @@ pub(crate) fn asked(start: usize, end: usize) -> Option<(u64, Vec<(usize, u64)>)
 /// kernel just reported. `None` if the memory is not write-watched (nor,
 /// with `guarded`, view memory, which is then guarded).
 pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Vec<(usize, u64)>)> {
-    use windows_sys::Win32::System::Memory::GetWriteWatch;
-    const WRITE_WATCH_FLAG_RESET: u32 = 1;
     let (first, last) = (start / PAGE, end.div_ceil(PAGE));
     let mut j = crate::l8ww::waited(crate::l8ww::Count::JournalWaitUs, || {
         JOURNAL.lock().unwrap_or_else(|e| e.into_inner())
@@ -343,34 +387,28 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
                 .collect(),
         ));
     }
-    let mut count = (last - first) * PAGE / KERNEL_PAGE;
-    j.found.resize(count.max(j.found.len()), 0);
-    let mut granularity = 0;
     #[cfg(feature = "diagnostics")]
     let started = std::time::Instant::now();
     // View memory is not write-watched: the guards answer, no call.
-    let failed = if crate::l8ww::known_views() && placeholder_at(start) {
+    let (failed, mut count) = if crate::l8ww::known_views() && placeholder_at(start) {
         crate::l8ww::add(crate::l8ww::Count::WatchesSkipped, 1);
-        true
+        (true, 0)
     } else {
-        let asking = std::time::Instant::now();
-        // SAFETY: the answer buffer holds `count` entries.
-        let failed = unsafe {
-            GetWriteWatch(
-                WRITE_WATCH_FLAG_RESET,
-                (first * PAGE) as *const _,
-                (last - first) * PAGE,
-                j.found.as_mut_ptr().cast(),
-                &mut count,
-                &mut granularity,
-            )
-        } != 0;
-        crate::l8ww::add_call(
-            if failed { crate::l8ww::Site::WatchFailed } else { crate::l8ww::Site::WatchOk },
-            asking.elapsed().as_micros() as u64,
-        );
-        failed
+        match kernel_watch(&mut j.found, first, last) {
+            Ok(count) => (false, count),
+            Err(count) => (true, count),
+        }
     };
+    if failed && count > 0 {
+        // Pieces answered before one failed: their pages were reset, and
+        // are written.
+        j.asked += 1;
+        let now = j.asked;
+        for k in 0..count {
+            let page = j.found[k] / PAGE;
+            j.written.insert(page, now);
+        }
+    }
     let guarded = if failed {
         count = 0;
         if !guarded {
@@ -1346,6 +1384,34 @@ mod tests {
             assert!(fresh().is_empty());
         }
         drop_placeholder(p, section, 2, &[0, 1]);
+    }
+
+    /// A long range of a write-watched reservation of the runtime's is
+    /// asked in pieces (`VICTORY_L8_WW_CHUNK_MB`): the writes in every piece
+    /// are reported, each once.
+    #[test]
+    fn a_long_watched_range_asked_in_pieces_reports_every_write() {
+        // Pieces of the size set, or of 64 MiB as `VICTORY_L8_WW_CHUNK_MB=64`
+        // would make them (one asking then).
+        let size = 3 * if crate::l8ww::chunk() == 0 { 64 << 20 } else { crate::l8ww::chunk() } + 5 * PAGE;
+        // SAFETY: a fresh write-watched allocation, kept (see
+        // `drop_placeholder`).
+        let p = unsafe {
+            VirtualAlloc(std::ptr::null(), size, MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH, PAGE_READWRITE)
+        } as usize;
+        assert_ne!(p, 0);
+        title_memory_reserved(p, size, true, false);
+        let at = [p + 8, p + size / 3, p + size / 2 + PAGE, p + size - 8];
+        for &a in &at {
+            // SAFETY: committed memory of ours.
+            unsafe { (a as *mut u8).write_volatile(1) };
+        }
+        let (now, written) = writes(p, p + size, false).expect("watched");
+        let fresh: Vec<usize> = written.iter().filter(|&&(_, w)| w == now).map(|&(page, _)| page).collect();
+        assert_eq!(fresh, at.map(|a| a / PAGE));
+        let (now, written) = writes(p, p + size, false).expect("watched");
+        assert!(written.iter().all(|&(_, w)| w < now), "nothing written since");
+        title_memory_reserved(p, size, false, false);
     }
 
     /// A placeholder of `blocks` blocks and a pagefile section as big,
