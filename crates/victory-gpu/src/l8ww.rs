@@ -12,7 +12,7 @@
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 
 /// The switches: name, on by default.
-const SWITCHES: &[(&str, bool)] = &[("WW_KNOWN_VIEWS", true)];
+const SWITCHES: &[(&str, bool)] = &[("WW_KNOWN_VIEWS", true), ("WW_ABSENT_TRUST", true)];
 
 /// Whether switch `name` (`VICTORY_L8_<name>`) is on.
 fn read(name: &str, default: bool) -> bool {
@@ -64,6 +64,32 @@ pub(crate) fn known_views() -> bool {
     on("WW_KNOWN_VIEWS")
 }
 
+/// `VICTORY_L8_WW_ABSENT_TRUST` (on; under Wine only): a block of a
+/// placeholder reservation of the runtime's that the guards found unmapped
+/// stays so until the runtime maps it, which it tells
+/// ([`crate::title_memory_remapped`]): no `VirtualQuery` at every check of
+/// a range that holds such blocks, nor for each block of a run that could
+/// not be guarded. Under Wine the runtime's sections are committed whole
+/// (`xmem`), so a mapped view has no uncommitted pages and a placeholder
+/// takes no commit; on Windows a view of a reserved section can be
+/// committed without a word, and the query stays.
+pub(crate) fn absent_trust() -> bool {
+    on("WW_ABSENT_TRUST") && on_wine()
+}
+
+/// Whether we run under Wine (its ntdll exports `wine_get_version`).
+pub(crate) fn on_wine() -> bool {
+    static WINE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *WINE.get_or_init(|| {
+        use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleA, GetProcAddress};
+        // SAFETY: plain lookups in ntdll, always loaded.
+        unsafe {
+            let ntdll = GetModuleHandleA(c"ntdll.dll".as_ptr().cast());
+            !ntdll.is_null() && GetProcAddress(ntdll, c"wine_get_version".as_ptr().cast()).is_some()
+        }
+    })
+}
+
 /// The calls counted, each with its microseconds.
 #[derive(Clone, Copy)]
 pub(crate) enum Site {
@@ -107,9 +133,12 @@ pub(crate) enum Count {
     /// `GetWriteWatch` calls not made: the range is view memory
     /// ([`known_views`]).
     WatchesSkipped,
+    /// `VirtualQuery` calls not made: blocks known unmapped
+    /// ([`absent_trust`]).
+    QueriesSkipped,
 }
 
-const COUNTS: usize = 4;
+const COUNTS: usize = 5;
 
 static COUNT: [AtomicU64; COUNTS] = [const { AtomicU64::new(0) }; COUNTS];
 
@@ -164,11 +193,13 @@ pub(crate) fn log(frames: f64) {
         "lot 8 per frame: GetWriteWatch {ok:.0} answered {ok_ms:.2} ms, {failed:.0} failed {failed_ms:.2} ms, {:.0} not made \
          (view memory, WW_KNOWN_VIEWS); \
          guard checks {guard:.0} {guard_ms:.2} ms; VirtualProtect {protect:.0} read-only {protect_ms:.2} ms, \
-         {open:.0} read-write {open_ms:.2} ms; VirtualQuery {query:.0} {query_ms:.2} ms; QueryWorkingSetEx \
+         {open:.0} read-write {open_ms:.2} ms; VirtualQuery {query:.0} {query_ms:.2} ms ({:.0} not made: \
+         blocks known unmapped, WW_ABSENT_TRUST); QueryWorkingSetEx \
          {set:.0} {set_ms:.2} ms; ReadProcessMemory {read:.0} {read_ms:.2} ms; guard faults {fault:.0} \
          ({:.0} on a block that faulted earlier in the frame) {fault_ms:.2} ms in the handler; waits for our \
          locks: guards {:.2} ms, write-watch journal {:.2} ms",
         c[Count::WatchesSkipped as usize],
+        c[Count::QueriesSkipped as usize],
         c[Count::FaultsAgain as usize],
         c[Count::GuardsWaitUs as usize] / 1e3,
         c[Count::JournalWaitUs as usize] / 1e3,

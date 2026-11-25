@@ -508,13 +508,23 @@ fn guard_timed(start: usize, end: usize) -> Option<Vec<usize>> {
     }
     let mut next_clean = 0;
     let mut uncommitted_until = first;
+    let mut trusted_run = false;
     for block in first..=last {
         while next_clean < clean.len() && clean[next_clean] < block {
             next_clean += 1;
         }
         let is_clean = next_clean < clean.len() && clean[next_clean] == block;
         let mut open = block < last && !is_clean;
-        if open && g.absent.contains(&block) {
+        let trusted = open && g.absent.contains(&block) && absent_trusted(block);
+        if trusted && !trusted_run {
+            // The query a run of such blocks took.
+            crate::l8ww::add(crate::l8ww::Count::QueriesSkipped, 1);
+        }
+        trusted_run = trusted;
+        if trusted {
+            // Unmapped until the runtime says otherwise.
+            open = false;
+        } else if open && g.absent.contains(&block) {
             // Ordinary commits need no runtime mapping notification. Reuse
             // this asking's query for the following blocks in the same region.
             if block >= uncommitted_until {
@@ -635,10 +645,22 @@ fn protect_here(g: &mut Guards, from: usize, to: usize) {
     for block in from..to {
         if set(block, block + 1) {
             note(g, block, block + 1);
+        } else if absent_trusted(block) {
+            // A block of the runtime's placeholders that cannot be made
+            // read-only is not mapped (a mapped one is committed whole).
+            crate::l8ww::add(crate::l8ww::Count::QueriesSkipped, 1);
+            g.absent.insert(block);
         } else if block < uncommitted_end(block) {
             g.absent.insert(block);
         }
     }
+}
+
+/// Whether the unmapped state of `block` is known without asking
+/// (`crate::l8ww::absent_trust`): a block of a placeholder reservation of
+/// the runtime's, under Wine.
+fn absent_trusted(block: usize) -> bool {
+    crate::l8ww::absent_trust() && placeholder_at(block * BLOCK)
 }
 
 /// The end (exclusive) of the whole uncommitted blocks starting at `block`.
@@ -1241,6 +1263,27 @@ mod tests {
         let fresh: Vec<usize> = after.iter().filter(|&&(_, w)| w == now).map(|&(page, _)| page).collect();
         assert_eq!(fresh, [(p + BLOCK) / PAGE]);
         drop_placeholder(p, section, 3, &[0, 1]);
+    }
+
+    /// In a placeholder of the runtime's, blocks found unmapped are
+    /// reported once and then not again until the runtime maps them, with
+    /// or without asking the system each time (`VICTORY_L8_WW_ABSENT_TRUST`).
+    #[test]
+    fn unmapped_blocks_of_a_known_placeholder_are_reported_once_until_mapped() {
+        let (p, section) = placeholder(3);
+        map_block(p, section, 0);
+        let pages = |block: usize| (p + block * BLOCK) / PAGE..(p + (block + 1) * BLOCK) / PAGE;
+        let fresh = |r: (u64, Vec<(usize, u64)>)| -> Vec<usize> {
+            r.1.iter().filter(|&&(_, w)| w == r.0).map(|&(page, _)| page).collect()
+        };
+        let (start, end) = (p, p + 3 * BLOCK);
+        let all: Vec<usize> = (0..3).flat_map(pages).collect();
+        assert_eq!(fresh(writes(start, end, true).unwrap()), all);
+        assert_eq!(fresh(writes(start, end, true).unwrap()), Vec::<usize>::new());
+        map_block(p, section, 2);
+        assert_eq!(fresh(writes(start, end, true).unwrap()), pages(2).collect::<Vec<_>>());
+        assert_eq!(fresh(writes(start, end, true).unwrap()), Vec::<usize>::new());
+        drop_placeholder(p, section, 3, &[0, 2]);
     }
 
     /// Blocks of a placeholder between views are reported once, then not
