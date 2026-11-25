@@ -1061,6 +1061,13 @@ impl HostHeap {
             let Some(handle) = heap.handle(index) else {
                 continue;
             };
+            // A buffer view's slot written since with a constant buffer
+            // view: left to the draws that read it (lot 7, as the pass over
+            // the heap does).
+            if crate::l7::cb_slots() && matches!(crate::descriptor::view(handle), Some(View::Constant(..))) {
+                crate::l7::add(crate::l7::CB_LEFT, 1);
+                continue;
+            }
             let Some(view) = self.mirror(index, handle, true) else {
                 continue;
             };
@@ -1508,6 +1515,11 @@ fn element_size(desc: &D3D12_SHADER_RESOURCE_VIEW_DESC) -> u64 {
 /// address and length.
 pub(crate) fn buffer_range(view: &View) -> Option<(u64, u64)> {
     let (base, words): (u64, &[u32; 10]) = match view {
+        // Lot 7 (`VICTORY_L7_CB_SLOTS`): a constant buffer view's bytes, so
+        // that a draw that reads its slot through a table it does not make
+        // afresh brings them up to date (`draw.rs` `readable`): they were
+        // brought up to date only by whatever else shared their copy.
+        &View::Constant(address, size) if crate::l7::cb_slots() => return Some((address, u64::from(size))),
         View::Shader(r, Some(desc)) => (
             crate::resource::buffer_bytes(*r as crate::object::This)?.0 as u64,
             desc,

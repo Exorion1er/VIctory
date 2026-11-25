@@ -1337,6 +1337,18 @@ impl State {
             let Some(handle) = heap.handle(index) else {
                 continue;
             };
+            // Lot 7 (`VICTORY_L7_CB_SLOTS`): a slot that held a buffer view
+            // and now holds a constant buffer view (the title's descriptor
+            // ring hands slots to either) is not made here: no shader picks
+            // a constant buffer by index (tables holding one are made afresh
+            // for each draw, `State::tables`). Made here, 1,400-3,600 a
+            // frame did not start on 256 bytes of their copy and took views'
+            // own copies (`VICTORY_L6_VIEW_COPY`) until none were left for
+            // the views that need one.
+            if crate::l7::cb_slots() && matches!(crate::descriptor::view(handle), Some(View::Constant(..))) {
+                crate::l7::add(crate::l7::CB_LEFT, 1);
+                continue;
+            }
             let Some(view) = host.mirror(index, handle, true) else {
                 continue;
             };
