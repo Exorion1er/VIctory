@@ -4363,6 +4363,7 @@ impl Host {
         let mut submitted = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
         crate::l6::announce();
         crate::l7::announce();
+        crate::l7perf::announce();
         // Descriptors the title copied into its heaps itself (lot 6,
         // `VICTORY_L6_HEAP_SYNC`), before anything of this submission is
         // prepared.

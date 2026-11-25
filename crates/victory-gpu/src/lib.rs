@@ -31,6 +31,7 @@ pub mod frame;
 mod host;
 #[cfg(windows)]
 mod l6;
+mod l7perf;
 #[cfg(windows)]
 mod l7;
 #[cfg(windows)]

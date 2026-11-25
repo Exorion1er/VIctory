@@ -36,6 +36,9 @@ pub(crate) struct Pending {
     /// When a thread began to make it (`crate::host::now_ms`, 0: not yet),
     /// for the drop reasons (diagnostics).
     started: AtomicU64,
+    /// The first frame that waited for it (`u64::MAX`: none yet), for
+    /// `VICTORY_L7_PIPELINE_WAIT_ONCE`.
+    waited: AtomicU64,
 }
 
 // SAFETY: D3D12 objects are free-threaded; the graphics state (whose input
@@ -55,6 +58,7 @@ impl Pending {
             key,
             used: AtomicBool::new(false),
             started: AtomicU64::new(0),
+            waited: AtomicU64::new(u64::MAX),
         }
     }
 
@@ -187,6 +191,18 @@ fn wait(p: &Pending, frame: u64) {
     let budget = wait_budget();
     if budget.is_zero() {
         return;
+    }
+    // Lot 7 (`VICTORY_L7_PIPELINE_WAIT_ONCE`): waited for in the first
+    // frame that asked for it, not again.
+    if crate::l7perf::pipeline_wait_once() {
+        crate::l7perf::announce();
+        let first = match p.waited.compare_exchange(u64::MAX, frame, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => frame,
+            Err(first) => first,
+        };
+        if first != frame {
+            return;
+        }
     }
     // The frame the budget belongs to, and what was waited of it (or is
     // taken by a thread waiting now).
