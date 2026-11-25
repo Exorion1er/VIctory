@@ -1658,7 +1658,7 @@ impl HostHeap {
         let Some(host) = host() else { return };
         let desc = D3D12_CONSTANT_BUFFER_VIEW_DESC {
             BufferLocation: gpu,
-            SizeInBytes: size.next_multiple_of(256),
+            SizeInBytes: constant_size(size),
         };
         // SAFETY: a slot of our heap; the memory is the caller's.
         unsafe {
@@ -2061,6 +2061,38 @@ fn buffer_view_ok(format: DXGI_FORMAT, first: u64, count: u32, stride: u32, raw:
             .is_some_and(|end| end <= width)
 }
 
+/// The bytes of a constant buffer view of `size` bytes: whole 256s, and at
+/// most the 64 KiB a shader can index. The host removes the device for a
+/// larger one, and the title's heap holds old views of any size in slots it
+/// does not use.
+fn constant_size(size: u32) -> u32 {
+    size.min(64 << 10).next_multiple_of(256)
+}
+
+/// Diagnostics: a buffer view left null for shaders that pick views by
+/// index, and why. Told at each doubling of the distinct views of a kind
+/// (by address and bytes: here its elements' bytes).
+fn left_null(why: &'static str, unordered: bool, address: u64, len: u64, element: u64, first: u64) {
+    if !cfg!(feature = "diagnostics") {
+        return;
+    }
+    type Seen = std::collections::BTreeMap<(&'static str, bool, u64), std::collections::HashSet<(u64, u64)>>;
+    static SEEN: Mutex<Seen> = Mutex::new(Seen::new());
+    let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+    let views = seen.entry((why, unordered, element)).or_default();
+    if views.insert((address, len)) && views.len().is_power_of_two() {
+        tracing::warn!(
+            views = views.len(),
+            unordered,
+            element,
+            first,
+            len,
+            address = format_args!("{address:#x}"),
+            "buffer views left null: {why}"
+        );
+    }
+}
+
 fn buffer_srv(
     view: &View,
     address: u64,
@@ -2136,6 +2168,7 @@ fn buffer_srv_on(
                 element,
                 "buffer view not on an element of its host copy"
             );
+            left_null("not on an element of their host copy", false, address, u64::from(buffer.NumElements) * element, element, buffer.FirstElement);
             return None;
         }
         buffer.FirstElement += offset / element;
@@ -2151,6 +2184,8 @@ fn buffer_srv_on(
         }
         REFUSED_VIEWS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         crate::l6::add(crate::l6::REFUSED, 1);
+        let why = if raw { "raw, refused by the host" } else { "refused by the host" };
+        left_null(why, false, address, u64::from(count) * element.max(1), element, first);
         once!(
             format = desc.Format.0,
             first,
@@ -2260,6 +2295,7 @@ fn buffer_uav_on(
             }
             crate::l6::add(crate::l6::OFF_ELEMENT, 1);
             once!(offset, element, "unordered buffer view not on an element of its host copy");
+            left_null("not on an element of their host copy", true, address, u64::from(buffer.NumElements) * element, element, buffer.FirstElement);
             return None;
         }
         buffer.FirstElement += offset / element;
@@ -2280,6 +2316,8 @@ fn buffer_uav_on(
         }
         REFUSED_VIEWS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         crate::l6::add(crate::l6::REFUSED, 1);
+        let why = if raw { "raw, refused by the host" } else { "refused by the host" };
+        left_null(why, true, address, u64::from(count) * element.max(1), element, first);
         once!(
             format = desc.Format.0,
             first,
@@ -2459,7 +2497,7 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
             }
             let desc = D3D12_CONSTANT_BUFFER_VIEW_DESC {
                 BufferLocation: gpu,
-                SizeInBytes: size.next_multiple_of(256),
+                SizeInBytes: constant_size(size),
             };
             // SAFETY: a slot of our heap; the range lies in the host copy.
             unsafe { device.CreateConstantBufferView(Some(&desc), at) };
@@ -3071,6 +3109,15 @@ mod tests {
     /// slot whose memory is not there is looked at again after
     /// 1, 2, 4 frames up to the limit; and what the pass reports about a
     /// slot written again meanwhile is dropped.
+    #[test]
+    fn constant_views_are_whole_and_at_most_64_kib() {
+        assert_eq!(constant_size(1), 256);
+        assert_eq!(constant_size(256), 256);
+        assert_eq!(constant_size(65_536), 65_536);
+        assert_eq!(constant_size(969_472), 65_536);
+        assert_eq!(constant_size(u32::MAX), 65_536);
+    }
+
     #[test]
     fn the_texture_queue_serves_the_newest_writes_first() {
         let mut q = TextureQueue::default();
