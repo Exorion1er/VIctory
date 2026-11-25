@@ -62,6 +62,19 @@ pub(crate) fn view_copy_budget() -> u64 {
     })
 }
 
+/// Lot 8: the most views' own copies kept (`VICTORY_L8_VIEW_COPY_MAX`,
+/// default 4096: 256 MB at 64 KiB each).
+pub(crate) fn view_copy_max() -> usize {
+    static M: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *M.get_or_init(|| {
+        std::env::var("VICTORY_L8_VIEW_COPY_MAX")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .unwrap_or(4096)
+            .max(64)
+    })
+}
+
 /// Logs the switches, once.
 pub(crate) fn announce() {
     static ONCE: std::sync::Once = std::sync::Once::new();

@@ -2819,14 +2819,40 @@ pub(crate) fn exact(view: &crate::descriptor::View, address: u64, len: u64, make
     if !make {
         return None;
     }
-    if map.len() >= EXACT_KEPT {
+    let bytes = len.next_multiple_of(256);
+    if crate::l7::view_copy_lru() {
+        // Lot 7 (`VICTORY_L7_VIEW_COPY_LRU`): within a budget of bytes.
+        let budget = crate::l7::view_copy_budget();
+        // Lot 8: each copy is a committed buffer of its own, at least
+        // 64 KiB of the card's memory and one more allocation in every
+        // submission; run 12 counted them at 256 bytes and reached 432,861
+        // copies (radv: "Not enough memory for command submission", then the
+        // title's own allocation failed). Count what they really take, and
+        // hold their number under `VICTORY_L8_VIEW_COPY_MAX`.
+        let cost = exact_cost(len);
+        let max = crate::l7::view_copy_max();
+        let over = |n: usize| EXACT_BYTES.load(Ordering::Relaxed) + cost > budget || n >= max;
+        if over(map.len()) && EXACT_FULL.load(Ordering::Relaxed) != frame {
+            exact_sweep(&mut map, frame, budget - budget / 8, max - max / 8);
+            if over(map.len()) {
+                // Nothing more to let go until the next frame.
+                EXACT_FULL.store(frame, Ordering::Relaxed);
+            }
+        }
+        if over(map.len()) {
+            crate::l6::add(crate::l6::OWN_REFUSED, 1);
+            return None;
+        }
+    } else if map.len() >= EXACT_KEPT {
         let oldest = map
             .iter()
             .min_by_key(|(_, (_, used))| *used)
             .map(|(k, (_, used))| (k.clone(), *used));
         match oldest {
             Some((key, used)) if used + 2 < frame => {
-                map.remove(&key);
+                if let Some((gone, _)) = map.remove(&key) {
+                    EXACT_BYTES.fetch_sub(exact_cost(gone.len), Ordering::Relaxed);
+                }
             }
             _ => {
                 crate::l6::add(crate::l6::OWN_REFUSED, 1);
@@ -2834,14 +2860,63 @@ pub(crate) fn exact(view: &crate::descriptor::View, address: u64, len: u64, make
             }
         }
     }
-    let (buffer, data) = host()?.shared_buffer(len.next_multiple_of(256))?;
+    let (buffer, data) = host()?.shared_buffer(bytes)?;
     crate::host::name(&buffer, || format!("title view {address:#x}+{len:#x}"));
     // SAFETY: a live buffer.
     let gpu = unsafe { buffer.GetGPUVirtualAddress() };
     let shadow = Arc::new(Shadow::new(buffer, data, gpu, address, len));
     map.insert(view.clone(), (shadow.clone(), frame));
+    EXACT_BYTES.fetch_add(exact_cost(len), Ordering::Relaxed);
     crate::l6::add(crate::l6::OWN_COPIES, 1);
+    crate::l7::OWN_ALIVE[0].store(map.len() as u64, Ordering::Relaxed);
+    crate::l7::OWN_ALIVE[1].store(EXACT_BYTES.load(Ordering::Relaxed), Ordering::Relaxed);
     Some(shadow)
+}
+
+/// The bytes of [`EXACT`]'s copies.
+static EXACT_BYTES: AtomicU64 = AtomicU64::new(0);
+
+/// The frame in which [`exact_sweep`] last left [`EXACT`] full.
+static EXACT_FULL: AtomicU64 = AtomicU64::new(u64::MAX);
+
+/// Lot 7 (`VICTORY_L7_VIEW_COPY_LRU`): lets go of views' own copies, the
+/// least recently asked for first, until their bytes are under `target`.
+/// Only a copy nothing else holds goes: no host slot shows it (a slot
+/// keeps the buffer it views) and no list holds it, and it was not asked
+/// for in this frame. The lot 6 cap let go of the oldest of 1,024 copies
+/// asked for two frames before, held or not: a slot that still showed it
+/// then read bytes nothing brought up to date any more (the passes find a
+/// view's copy by the view, and found none), and every view past the cap
+/// in a frame (1,400-3,600 in run 11) was left null.
+/// Lot 8: what one of [`EXACT`]'s copies takes: a committed buffer is
+/// placed on 64 KiB.
+fn exact_cost(len: u64) -> u64 {
+    len.next_multiple_of(256).max(64 << 10)
+}
+
+fn exact_sweep(map: &mut BTreeMap<crate::descriptor::View, (Arc<Shadow>, u64)>, frame: u64, target: u64, count: usize) {
+    let mut idle: Vec<(u64, crate::descriptor::View)> = map
+        .iter()
+        .filter(|(_, (shadow, used))| {
+            *used < frame && Arc::strong_count(shadow) == 1 && crate::host::references(&shadow.buffer) == 1
+        })
+        .map(|(view, (_, used))| (*used, view.clone()))
+        .collect();
+    idle.sort_unstable_by_key(|(used, _)| *used);
+    let mut gone = 0;
+    for (_, view) in idle {
+        if EXACT_BYTES.load(Ordering::Relaxed) <= target && map.len() <= count {
+            break;
+        }
+        if let Some((shadow, _)) = map.remove(&view) {
+            EXACT_BYTES.fetch_sub(exact_cost(shadow.len), Ordering::Relaxed);
+            crate::host::retire(shadow);
+            gone += 1;
+        }
+    }
+    crate::l7::add(crate::l7::OWN_LET_GO, gone);
+    crate::l7::OWN_ALIVE[0].store(map.len() as u64, Ordering::Relaxed);
+    crate::l7::OWN_ALIVE[1].store(EXACT_BYTES.load(Ordering::Relaxed), Ordering::Relaxed);
 }
 
 /// As [`find`], for an ask that is done with the copy when its list has
